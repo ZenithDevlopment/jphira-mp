@@ -103,13 +103,16 @@ public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
 
     private void sendWelcomeMessages(LocalPlayer player) {
         PlayerPointService.PointSummary point = PlayerPointService.getSummary(player);
-        connection.sendChat("————————————————————————————————————————");
-        connection.sendChat("欢迎来到服务器");
+        connection.sendChat(MESSAGE_SEPARATOR);
+        connection.sendChat("欢迎加入 Zenith 音游战队 服务器！");
+        connection.sendChat("玩家：" + player.getName() + "（#" + player.getId() + "）");
         connection.sendChat("当前积分：" + point.points() + "，积分排名：#" + point.rank());
-        connection.sendChat("创建房间 rank 查看排名。");
         connection.sendChat("输入房间名可创建或加入房间，房间名仅限字母、数字、-、_。");
-        connection.sendChat("————————————————————————————————————————");
+        connection.sendChat(MESSAGE_SEPARATOR);
     }
+
+    /** Kept in sync with the separator the room states use. */
+    private static final String MESSAGE_SEPARATOR = "————————————————————————————————————————";
 
     @Override
     protected void onUnhandledPacket(ServerBoundPacket packet) {

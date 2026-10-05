@@ -152,6 +152,11 @@ public class LocalRoom implements Room {
 
         if (shouldBroadcastJoin) {
             playerManager.broadcast(op -> op.memberJoined(player.getId(), player.getName(), isMonitor));
+            // The join packet is rendered by the client and does not always surface the name, so
+            // the room also gets a plain system line naming whoever just arrived.
+            String who = player.getName() + "（#" + player.getId() + "）";
+            playerManager.broadcast(op -> op.receiveChat(SYSTEM_PLAYER_ID,
+                    isMonitor ? who + " 进入房间观战" : "欢迎 " + who + " 加入房间"));
         }
 
         stateRef.get().handleJoin(player);
@@ -309,6 +314,9 @@ public class LocalRoom implements Room {
 
     /** First player to join and still present; drives host-only actions. */
     private volatile Player hostPlayer;
+
+    /** Sender id the client renders as a system message. */
+    private static final int SYSTEM_PLAYER_ID = -1;
 
     private final AtomicBoolean destroyed = new AtomicBoolean(false);
 
