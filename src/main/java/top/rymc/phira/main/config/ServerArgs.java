@@ -30,6 +30,7 @@ public class ServerArgs {
     private final int readTimeoutSeconds;
     private final int maxConnections;
     private final int maxRooms;
+    private final int emptyRoomTtlMinutes;
 
     public ServerArgs(String[] args) {
         OptionParser parser = new OptionParser();
@@ -85,6 +86,14 @@ public class ServerArgs {
                 .ofType(Integer.class)
                 .defaultsTo(200);
 
+        // Rooms created by operators use autoDestroy=false, meaning players may come and go.
+        // Reclaiming those too eagerly would delete the room out from under a live event.
+        OptionSpec<Integer> emptyRoomTtlSpec = parser.accepts("empty-room-ttl",
+                        "Minutes a room may stay empty before being reclaimed (0 disables reclaiming)")
+                .withRequiredArg()
+                .ofType(Integer.class)
+                .defaultsTo(120);
+
         parser.accepts("help", "Show this help message").forHelp();
 
         OptionSet options;
@@ -115,6 +124,7 @@ public class ServerArgs {
         this.readTimeoutSeconds = clampPositive(options.valueOf(readTimeoutSpec), 5);
         this.maxConnections = clampPositive(options.valueOf(maxConnectionsSpec), 1);
         this.maxRooms = clampPositive(options.valueOf(maxRoomsSpec), 1);
+        this.emptyRoomTtlMinutes = Math.max(0, options.valueOf(emptyRoomTtlSpec));
     }
 
     /** Keeps hand-edited values from turning the server into a no-op or a self-inflicted DoS. */

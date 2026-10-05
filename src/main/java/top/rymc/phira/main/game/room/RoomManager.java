@@ -17,8 +17,7 @@ import java.util.function.Function;
 
 public class RoomManager {
     private static final Map<String, Room> ROOMS = new ConcurrentHashMap<>();
-    /** Rooms created from the console or the web manager have autoDestroy off, so they need a janitor. */
-    private static final long EMPTY_ROOM_TTL_MILLIS = TimeUnit.MINUTES.toMillis(2);
+    /** Interval between sweeps; the threshold itself comes from {@code --empty-room-ttl}. */
     private static final long WATCHDOG_INTERVAL_SECONDS = 30;
     /** When the room was first seen empty; only meaningful while it stays empty. */
     private static final Map<String, Long> EMPTY_SINCE = new ConcurrentHashMap<>();
@@ -72,6 +71,12 @@ public class RoomManager {
 
     private static void reclaimEmptyRooms() {
         try {
+            int ttlMinutes = Server.getInstance().getArgs().getEmptyRoomTtlMinutes();
+            if (ttlMinutes <= 0) {
+                EMPTY_SINCE.clear();
+                return;
+            }
+            long ttlMillis = TimeUnit.MINUTES.toMillis(ttlMinutes);
             long now = System.currentTimeMillis();
             for (Room room : ROOMS.values()) {
                 String roomId = room.getRoomId();
@@ -80,9 +85,9 @@ public class RoomManager {
                     continue;
                 }
                 Long since = EMPTY_SINCE.putIfAbsent(roomId, now);
-                if (since != null && now - since >= EMPTY_ROOM_TTL_MILLIS) {
-                    Server.getLogger().info("Reclaiming room {} after {}s with nobody in it",
-                            roomId, (now - since) / 1000);
+                if (since != null && now - since >= ttlMillis) {
+                    Server.getLogger().info("Reclaiming room {} after {} minutes with nobody in it",
+                            roomId, (now - since) / 60_000);
                     room.destroy();
                 }
             }

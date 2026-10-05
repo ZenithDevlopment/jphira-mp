@@ -22,11 +22,13 @@ public class ServerChannelInitializer extends ChannelInitializer<Channel> {
     /** Pipeline name of the read timeout, replaced with a longer one after login. */
     public static final String READ_TIMEOUT_HANDLER = "readTimeout";
     /**
-     * Idle tolerance for a logged in player. Short timeouts are right for unknown peers, but a
-     * real client that pauses (backgrounded window, brief network hiccup) would otherwise be
-     * dropped mid round and forced into the five minute suspend.
+     * Idle tolerance for a logged in player.
+     *
+     * <p>Must outlast a full round: a client may legitimately send nothing between starting a
+     * chart and submitting its score, and being dropped there costs the player the round. Dead
+     * sockets are still bounded by {@code --max-connections}.
      */
-    public static final int AUTHENTICATED_READ_TIMEOUT_SECONDS = 120;
+    public static final int AUTHENTICATED_READ_TIMEOUT_SECONDS = 600;
 
     private final ChannelGroup allChannels;
 
