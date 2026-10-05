@@ -18,6 +18,7 @@ import top.rymc.phira.protocol.data.state.GameState;
 import top.rymc.phira.protocol.data.state.Playing;
 import top.rymc.phira.protocol.data.state.SelectChart;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -253,6 +254,7 @@ public final class RoomPlaying extends RoomGameState {
 
         room.getChartPool().finishPlayingRound(room.getSetting().getRefreshIntervalRounds());
         cancelForceFinishCountdown();
+        recoverMissingRecords();
         // Logged because an empty round leaves no trace anywhere else, which makes "the round
         // ended but nothing was recorded" impossible to tell apart from a crash.
         Server.getLogger().info("Round in {} ended: {} of {} player(s) submitted a record",
@@ -268,6 +270,46 @@ public final class RoomPlaying extends RoomGameState {
         updateGameState(state);
         state.broadcastVoteBoardHint();
         state.activate();
+    }
+
+    /**
+     * Pulls scores from Phira for players whose submission packet never arrived.
+     *
+     * <p>The client syncs its result to Phira on its own, so a round that ended without a
+     * {@code played} packet still leaves a trace there. Only records for this exact chart that
+     * were created after this round started are accepted, so an earlier play of the same chart
+     * cannot be mistaken for this one.
+     */
+    private void recoverMissingRecords() {
+        int chartId = chart.getId();
+        for (int playerId : activePlayerIds) {
+            if (gameRecords.containsKey(playerId)) {
+                continue;
+            }
+            try {
+                for (GameRecord candidate : PhiraFetcher.GET_RECENT_RECORDS.apply(playerId)) {
+                    if (candidate.getChart() != chartId || candidate.getTime() == null) {
+                        continue;
+                    }
+                    if (candidate.getTime().toInstant().toEpochMilli() < startedAt) {
+                        continue;
+                    }
+                    gameRecords.put(playerId, candidate);
+                    String name = room.getPlayerManager().getPlayers().stream()
+                            .filter(player -> player.getId() == playerId)
+                            .map(Player::getName)
+                            .findFirst()
+                            .orElse("#" + playerId);
+                    playerNames.putIfAbsent(playerId, name);
+                    Server.getLogger().info("Recovered record {} for {} (score {}) from Phira",
+                            candidate.getId(), name, candidate.getScore());
+                    broadcastSystemMessage(name + " 的成绩已从 Phira 同步：" + candidate.getScore());
+                    break;
+                }
+            } catch (IOException e) {
+                Server.getLogger().warn("Could not recover record for player {}: {}", playerId, e.getMessage());
+            }
+        }
     }
 
     private void broadcastRanking() {

@@ -60,6 +60,19 @@ public final class PhiraFetcher {
     public static ThrowableIntFunction<GameRecord, IOException> GET_RECORD_INFO =
             id -> recordCache.get(id, PhiraFetcher::fetchRecordById);
 
+    /**
+     * A player's most recent records, newest first.
+     *
+     * <p>Short lived cache: the caller uses it to recover a round whose score submission never
+     * arrived, so a stale list would report the wrong thing.
+     */
+    @Getter
+    private static final GenericCache<Integer, List<GameRecord>> recentRecordCache =
+            GenericCache.create(10, TimeUnit.SECONDS, 5000);
+
+    public static ThrowableIntFunction<List<GameRecord>, IOException> GET_RECENT_RECORDS =
+            id -> recentRecordCache.get(id, PhiraFetcher::fetchRecentRecordsByPlayer);
+
     public static ThrowableBiFunction<String, String, LoginResult, IOException> POST_LOGIN =
             PhiraFetcher::fetchLogin;
 
@@ -106,6 +119,14 @@ public final class PhiraFetcher {
         HttpRequest request = createRequest("record/" + id);
         String response = executeWithRetry(request);
         return GSON.fromJson(response, GameRecord.class);
+    }
+
+    /** Newest first, capped small because callers only scan the head of the list. */
+    private static List<GameRecord> fetchRecentRecordsByPlayer(int playerId) throws IOException {
+        HttpRequest request = createRequest("record?player=" + playerId + "&order=-time&pageNum=10");
+        String response = executeWithRetry(request);
+        GameRecord[] records = GSON.fromJson(response, GameRecord[].class);
+        return records == null ? List.of() : List.of(records);
     }
 
     private static LoginResult fetchLogin(String email, String password) throws IOException {

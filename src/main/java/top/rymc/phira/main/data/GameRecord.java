@@ -24,14 +24,15 @@ public class GameRecord {
     private float speed;
     private int maxCombo;
     private boolean best;
-    @SerializedName("bestStd")
+    // alternate: the list endpoint returns snake_case while the single record one uses camelCase.
+    @SerializedName(value = "bestStd", alternate = {"best_std"})
     private boolean bestStd;
     private int mods;
-    @SerializedName("fullCombo")
+    @SerializedName(value = "fullCombo", alternate = {"full_combo"})
     private boolean fullCombo;
     private OffsetDateTime time;
     private float std;
-    @SerializedName("stdScore")
+    @SerializedName(value = "stdScore", alternate = {"std_score"})
     private float stdScore;
 }
 
