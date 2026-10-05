@@ -221,7 +221,7 @@ public final class RoomPlaying extends RoomGameState {
 
         if (updateClientState && player.isOnline()) {
             player.operations().ifPresent(op -> {
-                op.updateHostStatus(true);
+                op.updateHostStatus(room.isHost(player));
                 op.enterState(new SelectChart(chart.getId()));
             });
         }
@@ -242,7 +242,7 @@ public final class RoomPlaying extends RoomGameState {
         RoomSelectChart state = new RoomSelectChart(room, stateUpdater, chart);
         activePlayers.stream()
                 .filter(Player::isOnline)
-                .forEach(player -> player.operations().ifPresent(op -> op.updateHostStatus(true)));
+                .forEach(player -> player.operations().ifPresent(op -> op.updateHostStatus(room.isHost(player))));
         broadcast(PlayerOperations::gameEnd);
         updateGameState(state);
         state.broadcastVoteBoardHint();

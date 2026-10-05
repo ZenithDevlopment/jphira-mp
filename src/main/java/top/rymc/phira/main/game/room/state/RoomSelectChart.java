@@ -294,7 +294,8 @@ public final class RoomSelectChart extends RoomGameState {
     }
 
     private void broadcastSelectedChartState(ChartInfo selectedChart) {
-        broadcast(operations -> operations.updateHostStatus(false));
+        // Host status is left alone: the chart here is decided by votes, not picked by the host,
+        // and demoting them would strip the voting controls from their own client.
         broadcast(operations -> operations.enterState(new SelectChart(selectedChart.getId())));
     }
 
