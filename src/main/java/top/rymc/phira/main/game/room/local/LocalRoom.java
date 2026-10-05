@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 public class LocalRoom implements Room {
@@ -136,6 +137,10 @@ public class LocalRoom implements Room {
             if (!added) {
                 return;
             }
+
+            if (!isMonitor && hostPlayer == null) {
+                hostPlayer = player;
+            }
         }
 
         if (shouldBroadcastJoin) {
@@ -148,14 +153,25 @@ public class LocalRoom implements Room {
     public void leave(Player player) {
         boolean shouldDestroy = false;
 
+        Player promoted = null;
         synchronized (lifecycleLock) {
             if (!playerManager.players.remove(player) && !playerManager.monitors.remove(player)) {
                 return;
             }
 
+            if (hostPlayer == player) {
+                // The set is unordered, so any remaining player takes over.
+                hostPlayer = playerManager.players.stream().findFirst().orElse(null);
+                promoted = hostPlayer;
+            }
+
             if (playerManager.players.isEmpty() && playerManager.monitors.isEmpty()) {
                 shouldDestroy = setting.autoDestroy;
             }
+        }
+
+        if (promoted != null) {
+            promoted.operations().ifPresent(op -> op.updateHostStatus(true));
         }
 
         playerManager.broadcast(op -> op.memberLeft(player.getId(), player.getName()));
@@ -172,7 +188,9 @@ public class LocalRoom implements Room {
     public class LocalOperation implements Operation {
 
         private void validateHost(Player player) {
-            throw GameOperationException.permissionDenied();
+            if (!isHost(player)) {
+                throw GameOperationException.notHost();
+            }
         }
 
         public void lockRoom(Player player) {
@@ -248,14 +266,39 @@ public class LocalRoom implements Room {
                     setting.live,
                     setting.locked,
                     setting.cycle,
-                    null,
+                    hostPlayer == null ? null : hostPlayer.getId(),
                     playerManager.getPlayersCopy(),
                     playerManager.getMonitorsCopy()
             );
         }
     }
 
+    /** Whoever joined first and is still in the room; monitors never become host. */
+    public boolean isHost(Player player) {
+        Player host = hostPlayer;
+        return host != null && player != null && host.getId() == player.getId();
+    }
+
+    /** First player to join and still present; drives host-only actions. */
+    private volatile Player hostPlayer;
+
+    private final AtomicBoolean destroyed = new AtomicBoolean(false);
+
+    @Override
+    public boolean isEmpty() {
+        return playerManager.players.isEmpty() && playerManager.monitors.isEmpty();
+    }
+
+    @Override
+    public void destroy() {
+        // Guarded: the last leaving player and the watchdog can race here.
+        if (destroyed.compareAndSet(false, true)) {
+            stateRef.get().dispose();
+            onDestroy.run();
+        }
+    }
+
     private void destroyRoom() {
-        onDestroy.run();
+        destroy();
     }
 }

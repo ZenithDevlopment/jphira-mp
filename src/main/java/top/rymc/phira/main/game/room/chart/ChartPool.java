@@ -1,6 +1,7 @@
 package top.rymc.phira.main.game.room.chart;
 
 import com.google.gson.reflect.TypeToken;
+import top.rymc.phira.main.Server;
 import top.rymc.phira.main.data.ChartInfo;
 import top.rymc.phira.main.util.GsonUtil;
 import top.rymc.phira.main.util.PhiraFetcher;
@@ -16,6 +17,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -38,6 +40,14 @@ public final class ChartPool {
             {30474, 42058},
             {33530, 52087}
     };
+    /** Order step for auto-appended pools, leaving room for manual insertion. */
+    private static final int ORDER_STEP = 10;
+    /** A single generate call will not create more pools than this. */
+    private static final int MAX_GENERATED_POOLS = 200;
+    /** A single batch add will not fetch more charts than this. */
+    public static final int MAX_BATCH_CHARTS = 500;
+    /** A single batch create will not make more empty pools than this. */
+    private static final int MAX_BATCH_POOLS = 50;
 
     private static final Type CHART_CACHE_TYPE = new TypeToken<Map<Integer, ChartInfo>>() {
     }.getType();
@@ -72,7 +82,7 @@ public final class ChartPool {
      */
     public static synchronized List<PoolSnapshot> getDefaultPools() {
         return sortedPools().stream()
-                .filter(pool -> pool.defaultFlag)
+                .filter(pool -> pool.defaultFlag && !pool.chartIds.isEmpty())
                 .map(ChartPool::snapshotOf)
                 .toList();
     }
@@ -85,12 +95,34 @@ public final class ChartPool {
         return pool == null ? null : snapshotOf(pool);
     }
 
+    /**
+     * Resolve pool ids into non-empty snapshots, preserving the requested order.
+     * Unknown and empty pools are skipped so that staged pools never reach a room.
+     */
+    public static synchronized List<PoolSnapshot> resolvePools(List<Integer> poolIds) {
+        List<PoolSnapshot> resolved = new ArrayList<>();
+        for (int poolId : distinct(poolIds)) {
+            PoolDefinition pool = findPoolDefinition(poolId);
+            if (pool == null || pool.chartIds.isEmpty()) {
+                continue;
+            }
+            resolved.add(snapshotOf(pool));
+        }
+        return List.copyOf(resolved);
+    }
+
     public static synchronized void addPool(int poolId, List<Integer> chartIds) throws IOException {
+        addPool(poolId, chartIds, PoolCategory.MANUAL, null, null);
+    }
+
+    /**
+     * Create a pool. Empty {@code chartIds} is allowed so that pools can be staged
+     * before charts are picked in the web manager.
+     */
+    public static synchronized void addPool(int poolId, List<Integer> chartIds, PoolCategory category,
+                                            Integer sizeLimit, Integer roundsPerStay) throws IOException {
         if (findPoolDefinition(poolId) != null) {
             throw new IllegalArgumentException("Pool already exists: " + poolId);
-        }
-        if (chartIds.isEmpty()) {
-            throw new IllegalArgumentException("Pool cannot be empty");
         }
 
         List<Integer> distinctChartIds = distinct(chartIds);
@@ -98,7 +130,12 @@ public final class ChartPool {
             loadChartInfo(chartId);
         }
 
-        pools.add(new PoolDefinition(poolId, null, false, distinctChartIds));
+        PoolDefinition pool = new PoolDefinition(poolId, null, false, distinctChartIds);
+        pool.category = category == null ? PoolCategory.MANUAL : category;
+        pool.sizeLimit = sizeLimit;
+        pool.roundsPerStay = roundsPerStay;
+        pool.order = nextOrder();
+        pools.add(pool);
         saveCache();
         savePools();
     }
@@ -118,24 +155,42 @@ public final class ChartPool {
     }
 
     public static synchronized void addChart(int poolId, int chartId) throws IOException {
-        PoolDefinition pool = requirePool(poolId);
-        ChartInfo info = loadChartInfo(chartId);
-        if (pool.chartIds.contains(info.getId())) {
-            return;
-        }
+        addCharts(poolId, List.of(chartId));
+    }
 
-        pool.chartIds.add(info.getId());
-        saveCache();
-        savePools();
+    /**
+     * Add many charts at once, persisting a single time.
+     *
+     * @return how many charts were actually appended
+     */
+    public static synchronized int addCharts(int poolId, List<Integer> chartIds) throws IOException {
+        PoolDefinition pool = requirePool(poolId);
+        List<Integer> distinctIds = distinct(chartIds);
+        // Each unknown chart costs a network fetch, so a single batch is bounded.
+        if (distinctIds.size() > MAX_BATCH_CHARTS) {
+            throw new IllegalArgumentException("Too many charts in one batch: " + distinctIds.size()
+                    + " (max " + MAX_BATCH_CHARTS + ")");
+        }
+        int added = 0;
+        for (int chartId : distinctIds) {
+            ChartInfo info = loadChartInfo(chartId);
+            if (pool.chartIds.contains(info.getId())) {
+                continue;
+            }
+            pool.chartIds.add(info.getId());
+            added++;
+        }
+        if (added > 0) {
+            saveCache();
+            savePools();
+        }
+        return added;
     }
 
     public static synchronized void removeChart(int poolId, int chartId) {
         PoolDefinition pool = requirePool(poolId);
         if (!pool.chartIds.contains(chartId)) {
             return;
-        }
-        if (pool.chartIds.size() == 1) {
-            throw new IllegalArgumentException("Pool cannot be empty");
         }
 
         pool.chartIds.remove(Integer.valueOf(chartId));
@@ -155,6 +210,31 @@ public final class ChartPool {
         }
         pool.defaultFlag = defaultFlag;
         savePoolsUnchecked();
+    }
+
+    /**
+     * Update pool metadata. A null argument keeps the current value, while a negative
+     * number resets that field to its default.
+     */
+    public static synchronized void updatePool(int poolId, PoolCategory category, Integer sizeLimit,
+                                                Integer roundsPerStay, Integer order, Boolean submissionOpen) {
+        PoolDefinition pool = requirePool(poolId);
+        if (category != null) {
+            pool.category = category;
+        }
+        pool.sizeLimit = sizeLimit == null ? pool.sizeLimit : resetIfNegative(sizeLimit);
+        pool.roundsPerStay = roundsPerStay == null ? pool.roundsPerStay : resetIfNegative(roundsPerStay);
+        if (order != null) {
+            pool.order = Math.max(0, order);
+        }
+        if (submissionOpen != null) {
+            pool.submissionOpen = submissionOpen;
+        }
+        savePoolsUnchecked();
+    }
+
+    private static Integer resetIfNegative(int value) {
+        return value < 0 ? null : value;
     }
 
     public static ChartInfo getChartInfo(int chartId) {
@@ -241,17 +321,124 @@ public final class ChartPool {
 
     private static List<PoolDefinition> sortedPools() {
         return pools.stream()
-                .sorted(Comparator.comparingInt(pool -> pool.id))
+                .sorted(Comparator.comparingInt((PoolDefinition pool) -> pool.order).thenComparingInt(pool -> pool.id))
                 .toList();
     }
 
+    private static int nextOrder() {
+        return pools.stream()
+                .mapToInt(pool -> pool.order)
+                .max()
+                .orElse(0) + ORDER_STEP;
+    }
+
+    /**
+     * Cuts every chart matching the rule into pools of at most {@code sizeLimit} charts.
+     *
+     * <p>Existing pools of the same category are left untouched, so regeneration is
+     * additive and can be repeated safely. The whole batch is persisted once, because
+     * a large catalogue easily produces hundreds of pools.
+     *
+     * @return ids of the pools that were created
+     */
+    public static synchronized List<Integer> generatePools(ScreeningRule rule, int sizeLimit, Integer roundsPerStay)
+            throws IOException {
+        if (sizeLimit < 1) {
+            throw new IllegalArgumentException("Pool size limit must be positive");
+        }
+        List<ChartInfo> matched = ChartIndex.search(rule, Integer.MAX_VALUE);
+        if (matched.isEmpty()) {
+            return List.of();
+        }
+
+        List<Integer> created = new ArrayList<>();
+        int nextId = pools.stream().mapToInt(pool -> pool.id).max().orElse(0) + 1;
+        // Order advances monotonically, so it is computed once instead of rescanning every pool.
+        int order = nextOrder();
+
+        for (int start = 0; start < matched.size(); start += sizeLimit) {
+            if (created.size() >= MAX_GENERATED_POOLS) {
+                Server.getLogger().warn("Stopped at {} generated pools; {} charts were left over. "
+                                + "Raise sizeLimit or generate in several passes.",
+                        MAX_GENERATED_POOLS, matched.size() - start);
+                break;
+            }
+            List<ChartInfo> slice = matched.subList(start, Math.min(start + sizeLimit, matched.size()));
+            List<Integer> chartIds = slice.stream().map(ChartInfo::getId).toList();
+
+            PoolDefinition pool = new PoolDefinition(nextId, null, false, chartIds);
+            pool.category = rule.category();
+            pool.sizeLimit = sizeLimit;
+            pool.roundsPerStay = roundsPerStay;
+            pool.order = order;
+            order += ORDER_STEP;
+            pools.add(pool);
+            created.add(nextId++);
+
+            // Reuse the already fetched metadata instead of hitting the network again.
+            slice.forEach(chart -> CHART_INFOS.putIfAbsent(chart.getId(), chart));
+        }
+
+        saveCache();
+        savePools();
+        Server.getLogger().info("Generated {} {} pools from {} charts (sizeLimit={})", created.size(),
+                rule.category(), matched.size(), sizeLimit);
+        return created;
+    }
+
+    /**
+     * Creates several empty pools at once, so an operator can stage a batch and then fill
+     * each one by hand. Ids are assigned server side to avoid races between clients.
+     *
+     * @return ids of the pools that were created
+     */
+    public static synchronized List<Integer> createEmptyPools(int count, PoolCategory category,
+                                                             Integer sizeLimit, Integer roundsPerStay) {
+        if (count < 1 || count > MAX_BATCH_POOLS) {
+            throw new IllegalArgumentException("Pool count must be between 1 and " + MAX_BATCH_POOLS);
+        }
+        List<Integer> created = new ArrayList<>();
+        int nextId = pools.stream().mapToInt(pool -> pool.id).max().orElse(0) + 1;
+        int order = nextOrder();
+
+        for (int index = 0; index < count; index++) {
+            PoolDefinition pool = new PoolDefinition(nextId, null, false, List.of());
+            pool.category = category == null ? PoolCategory.MANUAL : category;
+            pool.sizeLimit = sizeLimit;
+            pool.roundsPerStay = roundsPerStay;
+            pool.order = order;
+            order += ORDER_STEP;
+            pools.add(pool);
+            created.add(nextId++);
+        }
+
+        savePoolsUnchecked();
+        Server.getLogger().info("Created {} empty {} pools: {}", created.size(), category, created);
+        return created;
+    }
+
+    /** @return ids of pools already generated for the category */
+    public static synchronized List<Integer> poolIdsByCategory(PoolCategory category) {
+        return sortedPools().stream()
+                .filter(pool -> pool.category == category)
+                .map(pool -> pool.id)
+                .toList();
+    }
+
+    /** Drop unusable entries and backfill defaults. Gson bypasses field initializers, so absent keys land as null. */
     private static void normalizePools() {
         if (pools == null) {
             pools = new ArrayList<>();
+            return;
         }
+        pools = new ArrayList<>(pools);
+        pools.removeIf(Objects::isNull);
         for (PoolDefinition pool : pools) {
             if (pool.chartIds == null) {
                 pool.chartIds = new ArrayList<>();
+            }
+            if (pool.category == null) {
+                pool.category = PoolCategory.MANUAL;
             }
             pool.chartIds = distinct(pool.chartIds);
         }
@@ -263,17 +450,34 @@ public final class ChartPool {
         }
 
         for (PoolDefinition pool : pools) {
-            if (pool == null || pool.chartIds == null || pool.chartIds.isEmpty()) {
-                throw new IllegalStateException("Pool cannot be empty");
+            if (pool.chartIds.isEmpty()) {
+                Server.getLogger().warn("Pool {} is empty, rooms will skip it", pool.id);
             }
         }
     }
 
     private static PoolSnapshot snapshotOf(PoolDefinition pool) {
-        return new PoolSnapshot(pool.id, pool.favoriteId, pool.defaultFlag, List.copyOf(pool.chartIds));
+        return new PoolSnapshot(pool.id, pool.favoriteId, pool.defaultFlag, List.copyOf(pool.chartIds),
+                pool.category, pool.sizeLimit, pool.roundsPerStay, pool.order, pool.submissionOpen);
+    }
+
+    /** Whether players may submit charts into this pool. */
+    public static synchronized boolean isSubmissionOpen(int poolId) {
+        return requirePool(poolId).submissionOpen;
+    }
+
+    /** Pool ids that currently accept submissions, used by the player facing listing. */
+    public static synchronized List<PoolSnapshot> listOpenForSubmission() {
+        return sortedPools().stream()
+                .filter(pool -> pool.submissionOpen)
+                .map(ChartPool::snapshotOf)
+                .toList();
     }
 
     private static List<Integer> distinct(List<Integer> chartIds) {
+        if (chartIds == null || chartIds.isEmpty()) {
+            return new ArrayList<>();
+        }
         return chartIds.stream()
                 .distinct()
                 .collect(Collectors.toCollection(ArrayList::new));
@@ -313,7 +517,15 @@ public final class ChartPool {
         }
     }
 
-    public record PoolSnapshot(int id, Integer favoriteId, boolean defaultFlag, List<Integer> chartIds) {
+    /**
+     * Immutable view of a pool definition.
+     *
+     * @param roundsPerStay rounds to play before rotating, {@code null} to use the room-level interval
+     * @param sizeLimit     intended pool size, {@code null} when unbounded
+     */
+    public record PoolSnapshot(int id, Integer favoriteId, boolean defaultFlag, List<Integer> chartIds,
+                               PoolCategory category, Integer sizeLimit, Integer roundsPerStay, int order,
+                               boolean submissionOpen) {
     }
 
     private static final class PoolConfig {
@@ -325,6 +537,12 @@ public final class ChartPool {
         private Integer favoriteId;
         private boolean defaultFlag;
         private List<Integer> chartIds = new ArrayList<>();
+        private PoolCategory category = PoolCategory.MANUAL;
+        private Integer sizeLimit;
+        private Integer roundsPerStay;
+        private int order;
+        /** Whether players may submit charts into this pool. */
+        private boolean submissionOpen;
 
         private PoolDefinition(int id, Integer favoriteId, boolean defaultFlag, List<Integer> chartIds) {
             this.id = id;

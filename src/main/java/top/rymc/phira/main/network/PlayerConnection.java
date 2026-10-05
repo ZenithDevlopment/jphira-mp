@@ -21,18 +21,35 @@ import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 @Getter
 public class PlayerConnection extends ChannelInboundHandlerAdapter {
 
-    private final ExecutorService packetExecutor;
+    /**
+     * Shared pool instead of one thread per connection. Packets of a single connection are still
+     * handled strictly one at a time, but idle connections cost no thread.
+     */
+    private static final ExecutorService PACKET_POOL = ExecutorServiceManager.registerService(
+            Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors() * 2),
+                    ThreadFactoryCompat.THREAD_FACTORY_CREATOR.apply("Packet-Worker")));
+
+    /** Guards against a client flooding the server with tiny packets. */
+    private static final int PACKETS_PER_SECOND = 200;
+
+    private final ConcurrentLinkedQueue<Runnable> pendingPackets = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger pendingCount = new AtomicInteger();
 
     private final Channel channel;
     private final InetSocketAddress remoteAddress;
+
+    private long rateWindowStart = System.currentTimeMillis();
+    private int rateWindowCount;
 
     @Setter
     private volatile ServerBoundPacketHandler packetHandler;
@@ -43,10 +60,48 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
     public PlayerConnection(Channel channel, InetSocketAddress remoteAddress) {
         this.channel = channel;
         this.remoteAddress = remoteAddress;
+    }
 
-        this.packetExecutor = ExecutorServiceManager.registerService(Executors.newSingleThreadExecutor(
-                ThreadFactoryCompat.THREAD_FACTORY_CREATOR.apply("LocalPlayer-Worker-" + getRemoteAddressAsString())
-        ));
+    /**
+     * Queues a packet, keeping the order it arrived in.
+     *
+     * <p>{@code pendingCount} doubles as the scheduling token: only the caller that raises it from
+     * zero submits a drain, and the drain keeps running while more packets arrive.
+     */
+    private void submitPacket(Runnable task) {
+        pendingPackets.add(task);
+        if (pendingCount.getAndIncrement() == 0) {
+            PACKET_POOL.execute(this::drainPackets);
+        }
+    }
+
+    private void drainPackets() {
+        do {
+            Runnable task = pendingPackets.poll();
+            if (task != null) {
+                // Must not escape: the token would never return to zero and every later
+                // packet on this connection would be stranded in the queue forever.
+                try {
+                    task.run();
+                } catch (Throwable t) {
+                    Server.getLogger().error("Packet handling failed for {}", getRemoteAddressAsString(), t);
+                }
+            }
+        } while (pendingCount.decrementAndGet() > 0);
+    }
+
+    /** Drops the packet instead of disconnecting: a brief burst is normal, a flood is not. */
+    private boolean rateLimited() {
+        long now = System.currentTimeMillis();
+        if (now - rateWindowStart >= 1000) {
+            rateWindowStart = now;
+            rateWindowCount = 0;
+        }
+        if (rateWindowCount >= PACKETS_PER_SECOND) {
+            return true;
+        }
+        rateWindowCount++;
+        return false;
     }
 
     public void onClose(Consumer<ChannelHandlerContext> handler) {
@@ -66,11 +121,21 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
 
         ServerBoundPacket packet = (ServerBoundPacket) msg;
 
-        packetExecutor.execute(() -> handle(ctx, packet));
+        if (rateLimited()) {
+            Server.getLogger().warn("Closing {}, packet rate exceeded {} per second", getRemoteAddressAsString(), PACKETS_PER_SECOND);
+            ctx.close();
+            return;
+        }
+
+        submitPacket(() -> handle(ctx, packet));
     }
 
     @SuppressWarnings("resource")
     private void handle(ChannelHandlerContext ctx, ServerBoundPacket packet) {
+        // The connection may have gone away while this packet was queued behind an earlier one.
+        if (isClosed()) {
+            return;
+        }
         try {
             packet.handle(packetHandler);
         } catch (Throwable t) {
@@ -102,8 +167,8 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        packetExecutor.shutdownNow();
-
+        // Nothing to stop here: the packet pool is shared, and pending work is discarded by the
+        // isClosed check the handlers perform before touching the channel.
         Server.getLogger().info("Client disconnected: {}", getRemoteAddressAsString());
 
         for (Consumer<ChannelHandlerContext> handler : closeHandlers) {
@@ -119,6 +184,12 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
 
     public Optional<ChannelFuture> send(ClientBoundPacket packet) {
         if (this.isClosed()) {
+            return Optional.empty();
+        }
+
+        // A client that cannot keep up would otherwise grow the outbound buffer without bound.
+        if (!channel.isWritable()) {
+            Server.getLogger().warn("Dropping outbound packet to {}, buffer is backed up", getRemoteAddressAsString());
             return Optional.empty();
         }
 

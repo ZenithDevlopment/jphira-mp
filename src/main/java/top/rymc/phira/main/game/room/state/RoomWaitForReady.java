@@ -203,6 +203,12 @@ public final class RoomWaitForReady extends RoomGameState {
     }
 
     @Override
+    public void dispose() {
+        countdownTasks.forEach(task -> task.cancel(false));
+        countdownTasks.clear();
+    }
+
+    @Override
     public GameState toProtocol() {
         return new WaitForReady();
     }

@@ -1,5 +1,6 @@
 package top.rymc.phira.main.data;
 
+import com.google.gson.annotations.SerializedName;
 import lombok.*;
 
 import java.time.OffsetDateTime;
@@ -23,11 +24,14 @@ public class GameRecord {
     private float speed;
     private int maxCombo;
     private boolean best;
+    @SerializedName("bestStd")
     private boolean bestStd;
     private int mods;
+    @SerializedName("fullCombo")
     private boolean fullCombo;
     private OffsetDateTime time;
     private float std;
+    @SerializedName("stdScore")
     private float stdScore;
 }
 

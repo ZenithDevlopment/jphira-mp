@@ -20,6 +20,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -33,7 +34,7 @@ public final class RoomSelectChart extends RoomGameState {
     private final ChartPool.PoolSnapshot currentPoolInfo;
     private final List<ChartInfo> currentPool;
     private final int countdownSeconds;
-    private volatile boolean countdownRunning;
+    private final AtomicBoolean countdownRunning = new AtomicBoolean();
     private volatile ChartInfo lockedChart;
 
     public RoomSelectChart(LocalRoom room, Consumer<RoomGameState> stateUpdater) {
@@ -51,7 +52,9 @@ public final class RoomSelectChart extends RoomGameState {
 
     @Override
     public void handleJoin(Player player) {
-        sendVoteBoardHint(player);
+        // Charts are not part of the protocol state, so a newcomer has no way to vote
+        // until the pool is pushed to them.
+        sendVoteBoard(player);
         updateCountdownState();
     }
 
@@ -62,9 +65,25 @@ public final class RoomSelectChart extends RoomGameState {
         updateCountdownState();
     }
 
+    /**
+     * Host shortcut: skip the rest of the countdown and start now.
+     *
+     * <p>Unlike the automatic path this ignores {@code minPlayer}, so an operator can get a
+     * round going (or unstick one) without waiting for more players to arrive.
+     */
     @Override
     public void requireStart(Player player) {
-        throw GameOperationException.permissionDenied();
+        if (countOnlinePlayers() == 0) {
+            throw GameOperationException.permissionDenied();
+        }
+
+        stopCountdown();
+        ChartInfo selectedChart = lockedChart != null ? lockedChart : selectWinningChart();
+        broadcastSystemMessage(player.getName() + " 提前开始本轮，曲目：" + formatChartName(selectedChart));
+
+        RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart);
+        updateGameState(state);
+        state.startCountdown();
     }
 
     @Override
@@ -87,14 +106,19 @@ public final class RoomSelectChart extends RoomGameState {
 
     }
 
+    /**
+     * The round already moved on, so a late abort is dropped instead of reported.
+     *
+     * <p>These arrive routinely right after a round is settled: the client sends them based on
+     * its own state, which lags behind the server by one packet.
+     */
     @Override
     public void abort(Player player) {
-        throw GameOperationException.invalidState();
     }
 
+    /** Same as {@link #abort}: a score for a round that has already been settled. */
     @Override
     public void played(Player player, int recordId) {
-        throw GameOperationException.invalidState();
     }
 
     public void vote(Player player, int chartId) {
@@ -114,7 +138,35 @@ public final class RoomSelectChart extends RoomGameState {
         ChartInfo chart = ChartPool.getChartInfo(chartId);
         voteByPlayer.put(player, chartId);
         broadcastSystemMessage(player.getName() + " 已投票：" + formatChartName(chart));
+        broadcastLeadingChart();
         broadcastVoteBoardHint();
+    }
+
+    /**
+     * Publishes the leading chart so clients see a selection.
+     *
+     * <p>Without this the client never receives a selected chart, and pressing start is rejected
+     * locally before the packet ever reaches the server.
+     */
+    private void broadcastLeadingChart() {
+        Map<Integer, Long> votes = voteByPlayer.values().stream()
+                .collect(Collectors.groupingBy(id -> id, Collectors.counting()));
+
+        ChartInfo leading = currentPool.stream()
+                .filter(chart -> votes.containsKey(chart.getId()))
+                .max(Comparator.comparingLong(chart -> votes.get(chart.getId())))
+                .orElse(null);
+        if (leading == null) {
+            return;
+        }
+
+        int firstVoter = voteByPlayer.entrySet().stream()
+                .filter(entry -> entry.getValue().equals(leading.getId()))
+                .map(entry -> entry.getKey().getId())
+                .min(Integer::compareTo)
+                .orElse(SYSTEM_PLAYER_ID);
+
+        broadcast(op -> op.selectChart(leading.getId(), leading.getName(), firstVoter));
     }
 
     public void broadcastVoteBoard() {
@@ -153,10 +205,6 @@ public final class RoomSelectChart extends RoomGameState {
         broadcast(op -> op.receiveChat(SYSTEM_PLAYER_ID, "点击锁定房间按钮查看当前谱池状态。"));
     }
 
-    private void sendVoteBoardHint(Player player) {
-        sendSystemMessage(player, "点击锁定房间按钮查看当前谱池状态。");
-    }
-
     private List<String> buildVoteBoardLines() {
         Map<Integer, Long> votes = voteByPlayer.values().stream()
                 .collect(Collectors.groupingBy(id -> id, Collectors.counting()));
@@ -184,11 +232,11 @@ public final class RoomSelectChart extends RoomGameState {
     }
 
     private void startCountdown() {
-        if (countdownRunning) {
+        // Compare-and-set: two players joining at once must not schedule a second full countdown.
+        if (!countdownRunning.compareAndSet(false, true)) {
             return;
         }
 
-        countdownRunning = true;
         broadcastSystemMessage("已达到开局人数，" + countdownSeconds + " 秒后锁定投票并进入准备阶段。人数不足会取消倒计时。");
 
         NOTICE_SECONDS.stream()
@@ -201,19 +249,29 @@ public final class RoomSelectChart extends RoomGameState {
         countdownTasks.add(TIMER.schedule(this::finishCountdown, countdownSeconds, TimeUnit.SECONDS));
     }
 
+    private void stopCountdown() {
+        countdownRunning.set(false);
+        countdownTasks.forEach(task -> task.cancel(false));
+        countdownTasks.clear();
+    }
+
     private void cancelCountdown() {
-        if (!countdownRunning) {
+        if (!countdownRunning.get()) {
             return;
         }
 
-        countdownRunning = false;
-        countdownTasks.forEach(task -> task.cancel(false));
-        countdownTasks.clear();
+        stopCountdown();
         broadcastSystemMessage("在线玩家不足，开局倒计时已取消。");
     }
 
+    @Override
+    public void dispose() {
+        countdownTasks.forEach(task -> task.cancel(false));
+        countdownTasks.clear();
+    }
+
     private void noticeCountdown(int seconds) {
-        if (countdownRunning && countOnlinePlayers() >= room.getSetting().getMinPlayer()) {
+        if (countdownRunning.get() && countOnlinePlayers() >= room.getSetting().getMinPlayer()) {
             broadcastSystemMessage("投票锁定倒计时：" + seconds + " 秒");
             if (seconds == 1) {
                 lockedChart = selectWinningChart();
@@ -230,11 +288,11 @@ public final class RoomSelectChart extends RoomGameState {
     }
 
     private void finishCountdown() {
-        if (!countdownRunning) {
+        if (!countdownRunning.get()) {
             return;
         }
 
-        countdownRunning = false;
+        countdownRunning.set(false);
         countdownTasks.clear();
         if (countOnlinePlayers() < room.getSetting().getMinPlayer()) {
             broadcastSystemMessage("在线玩家不足，本轮取消。");

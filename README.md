@@ -33,13 +33,71 @@ java -jar jphira-mp-<version>.jar --port 12346
 
 当前 jphira-mp 可用的命令行参数:
 * `--help`: 显示帮助信息
-* `--port <port>`: 指定服务器监听端口，默认为 `12346`
-* `--host <host>`: 指定服务器监听地址，默认为 `0.0.0.0`
+* `--port <port>`: 指定游戏服务器监听端口，默认为 `12346`
+* `--host <host>`: 指定游戏服务器监听地址，默认为 `0.0.0.0`
+* `--http-host <host>`: 指定 HTTP 控制面监听地址，默认为 `0.0.0.0`
+* `--http-port <port>`: 指定 HTTP 控制面监听端口，默认为 `8080`
 * `--plugin <folder>`: 指定插件目录，默认为 `plugins`
 * `--proxy-protocol`: 启用 Proxy Protocol 支持（用于代理等，如: [此内容](https://doc.natfrp.com/bestpractice/realip.html)），默认为 `false`
 * `--language`: 设置服务器默认的玩家语言，默认为 `zh-CN`
 
+`--host` 只影响游戏端口，HTTP 控制面需要单独用 `--http-host` / `--http-port`。
+HTTP 端口绑定失败时服务端会直接启动失败并提示，避免出现「游戏能玩但管理面板不可用」的情况。
+
 关闭 jphira-mp 同样与 Minecraft 服务端类似，在控制台输入 `stop` 命令即可关闭服务器。
+
+## 🎛️ 控制台命令
+
+| 命令 | 说明 |
+|---|---|
+| `stop` | 关闭服务器 |
+| `say <text>` | 向所有在线玩家广播 |
+| `admin list` / `admin add <userId>` / `admin remove <userId>` | 管理员名单 |
+| `room list` / `room create <id> [poolId...]` / `room remove <id>` | 房间管理 |
+| `room <id> end` | 强制结束当前 Playing |
+| `room <id> config <key> <value>` | 房间配置，含 `interval`（池未单独设置轮次时的兜底间隔） |
+| `room <id> pool switch <poolId>` | 设置下一轮生效的池 |
+| `room <id> pool favorite <favoriteId\|none>` | 覆盖当前池展示收藏夹 |
+| `pool list` | 列出全部谱池及其类别、顺序、容量与轮次配额 |
+| `pool add <id> <chartIds...>` / `pool remove <id>` | 增删谱池（允许建空池后再挑谱） |
+| `pool chart add\|remove <poolId> <chartId>` | 增删池内谱面 |
+| `pool meta <poolId> <category> [sizeLimit] [roundsPerStay] [order]` | 设置类别与轮换参数 |
+| `pool generate <category> [sizeLimit] [roundsPerStay] [probeBudget]` | 按规则批量切池 |
+| `chart index` | 查看谱面索引状态 |
+| `chart refresh [plain]` | 后台拉取 Phira 谱面目录 |
+| `chart search <category> [limit]` | 按规则筛选并列出候选谱面 |
+| `chart duration <chartIds...>` | 探测谱面时长 |
+| `submission list` | 查看全部待审投稿 |
+| `submission list <poolId>` | 查看某个池的投稿（含已审核） |
+| `submission approve <poolId> <chartId>` | 通过投稿并把谱面加入该池 |
+| `submission reject <poolId> <chartId> [reason]` | 拒绝投稿，可附理由 |
+
+## 📮 谱面投稿
+
+管理员在池详情页打开「开启玩家投稿」后，任何用 Phira 账号登录的玩家都可以在
+「谱面投稿」页搜索并勾选谱面投进该池（一次最多 20 张）。
+
+- 同一玩家对同一张谱面在同一池只能投一次；**不同玩家投同一张会合并成一条**，
+  审核界面点「N 人」可以看到每个投稿人的头像、ID 和时间。
+- 管理员通过后谱面**直接加入该池**；拒绝只记录状态和理由，不动池内容。
+- 待审的投稿玩家可以自己撤回；已通过的不能撤回。
+- 玩家的投稿记录存在 `data/submissions.json`。
+
+## 🗂️ 谱池模型
+
+`data/chart-pools.json` 中每个池除 `id` / `chart_ids` 外还带有元数据：
+
+| 字段 | 含义 |
+|---|---|
+| `category` | `REGULAR` / `CONFIGURED` / `TB` / `MANUAL`，决定轮换与展示 |
+| `size_limit` | 目标容量，批量生成时按此切分 |
+| `rounds_per_stay` | 停留轮数，缺省时回退到房间的 `interval` |
+| `order` | 轮换顺序，其次按 `id` |
+
+类别对应的准入规则见 [docs/pool-screening.md](docs/pool-screening.md)，其中也记录了
+Phira 接口的实测行为。首次使用需要先 `chart refresh` 拉取谱面目录，
+或调用 `GET /api/v1/chart/search?refresh=1`。
+控制台管理、批量切池与人工挑谱的接口说明见 [docs/integration.md](docs/integration.md)。
 
 ## 🔌 插件开发（当前分支不支持）
 [![](https://jitpack.io/v/lRENyaaa/jphira-mp.svg)](https://jitpack.io/#lRENyaaa/jphira-mp)  

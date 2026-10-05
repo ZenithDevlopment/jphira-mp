@@ -56,6 +56,14 @@ public class ServerChannelInitializer extends ChannelInitializer<Channel> {
     private void initChannel0(Channel channel, InetSocketAddress remoteAddress) {
         String ipPort = remoteAddress.getAddress().getHostAddress() + ":" + remoteAddress.getPort();
 
+        String refused = ConnectionLimiter.accept(remoteAddress.getAddress());
+        if (refused != null) {
+            Server.getLogger().warn("Refusing connection from {}: {}", ipPort, refused);
+            channel.close();
+            return;
+        }
+        channel.closeFuture().addListener(future -> ConnectionLimiter.release(remoteAddress.getAddress()));
+
         Server.getLogger().info("Establishing a connection from {}", ipPort);
 
         HandshakeDecoder handshake = new HandshakeDecoder();
@@ -75,7 +83,7 @@ public class ServerChannelInitializer extends ChannelInitializer<Channel> {
             channel.pipeline()
                     .addLast(new FrameDecoder())
                     .addLast(new FrameEncoder())
-                    .addLast(new ReadTimeoutHandler(5, TimeUnit.SECONDS))
+                    .addLast(new ReadTimeoutHandler(Server.getInstance().getArgs().getReadTimeoutSeconds(), TimeUnit.SECONDS))
                     .addLast(new ServerPacketDecoder())
                     .addLast(new ServerPacketEncoder());
 

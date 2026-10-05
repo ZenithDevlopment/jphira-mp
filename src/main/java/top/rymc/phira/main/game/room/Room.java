@@ -26,6 +26,15 @@ public interface Room {
 
     boolean containsMonitor(Player player);
 
+    /** True when neither players nor monitors remain. */
+    boolean isEmpty();
+
+    /**
+     * Reclaims the room and cancels whatever its current state scheduled.
+     * Safe to call more than once.
+     */
+    void destroy();
+
     interface Operation {
 
         void lockRoom(Player player);

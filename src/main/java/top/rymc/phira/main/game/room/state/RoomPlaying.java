@@ -2,11 +2,13 @@ package top.rymc.phira.main.game.room.state;
 
 import top.rymc.phira.main.data.ChartInfo;
 import top.rymc.phira.main.data.GameRecord;
+import top.rymc.phira.main.data.RoundRecord;
 import top.rymc.phira.main.game.exception.GameOperationException;
 import top.rymc.phira.main.game.player.Player;
 import top.rymc.phira.main.game.player.operations.PlayerOperations;
 import top.rymc.phira.main.game.point.PlayerPointService;
 import top.rymc.phira.main.game.record.PhiraRecord;
+import top.rymc.phira.main.game.record.RoundRecordService;
 import top.rymc.phira.main.game.room.local.LocalRoom;
 import top.rymc.phira.main.util.PhiraFetcher;
 import top.rymc.phira.protocol.data.monitor.judge.JudgeEvent;
@@ -15,7 +17,9 @@ import top.rymc.phira.protocol.data.state.GameState;
 import top.rymc.phira.protocol.data.state.Playing;
 import top.rymc.phira.protocol.data.state.SelectChart;
 
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,7 +45,9 @@ public final class RoomPlaying extends RoomGameState {
     private final Map<Player, List<JudgeEvent>> judgeEvents = new ConcurrentHashMap<>();
     private final Set<ScheduledFuture<?>> forceFinishTasks = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean roundFinished = new AtomicBoolean(false);
-    private volatile boolean forceFinishCountdownStarted;
+    private final AtomicBoolean forceFinishCountdownStarted = new AtomicBoolean(false);
+    /** When the round went live; stamped into the round record. */
+    private final long startedAt = System.currentTimeMillis();
 
     public RoomPlaying(LocalRoom room, Consumer<RoomGameState> stateUpdater) {
         super(room, stateUpdater);
@@ -54,6 +60,9 @@ public final class RoomPlaying extends RoomGameState {
     public RoomPlaying(LocalRoom room, Consumer<RoomGameState> stateUpdater, ChartInfo chart, Set<Player> activePlayers) {
         super(room, stateUpdater, chart);
         this.activePlayers.addAll(activePlayers);
+        // Registered here rather than on the first submitted record: if every player stalls on
+        // the loading screen without submitting or disconnecting, the round would never end.
+        startForceFinishCountdown();
     }
 
     @Override
@@ -172,11 +181,11 @@ public final class RoomPlaying extends RoomGameState {
     }
 
     private void startForceFinishCountdown() {
-        if (forceFinishCountdownStarted) {
+        // Compare-and-set: two players submitting at once must not schedule the task twice.
+        if (!forceFinishCountdownStarted.compareAndSet(false, true)) {
             return;
         }
 
-        forceFinishCountdownStarted = true;
         int forceFinishSeconds = room.getSetting().getForceFinishSeconds();
         if (forceFinishSeconds > FORCE_FINISH_NOTICE_SECONDS) {
             forceFinishTasks.add(TIMER.schedule(
@@ -190,6 +199,12 @@ public final class RoomPlaying extends RoomGameState {
 
     public void forceFinishByServer() {
         forceFinishGame();
+    }
+
+    @Override
+    public void dispose() {
+        forceFinishTasks.forEach(task -> task.cancel(false));
+        forceFinishTasks.clear();
     }
 
     private void forceFinishGame() {
@@ -247,32 +262,70 @@ public final class RoomPlaying extends RoomGameState {
                 ))
                 .toList();
 
-        broadcastSystemMessage(MESSAGE_SEPARATOR);
-        broadcastSystemMessage("本轮排名");
+        // Phase 1: decide the ranks and award the whole round in one batch, so the shared
+        // ranking cache is invalidated once instead of once per player.
+        List<RankedPlayer> ranked = new ArrayList<>(ranking.size());
+        Map<Integer, Integer> gainedByPlayerId = new LinkedHashMap<>();
+        Map<Integer, String> nameByPlayerId = new LinkedHashMap<>();
         int rank = 0;
         GameRecord previous = null;
         for (int i = 0; i < ranking.size(); i++) {
             Map.Entry<Player, GameRecord> entry = ranking.get(i);
-            Player player = entry.getKey();
             GameRecord record = entry.getValue();
             if (previous == null || compareRecord(record, previous) != 0) {
                 rank = i + 1;
             }
-            int gainedPoints = getPointsByRank(rank);
-            int totalPoints = PlayerPointService.addPoints(player, gainedPoints);
-            broadcastSystemMessage(String.format(
-                    "%d. %s - 分数: %s, 准度: %s%%, 误差: ±%sms, 积分: +%s, 总积分: %s",
-                    rank,
-                    player.getName(),
-                    record.getScore(),
-                    record.getAccuracy() * 100,
-                    record.getStd() * 1000,
-                    gainedPoints,
-                    totalPoints
-            ));
+            ranked.add(new RankedPlayer(entry.getKey(), record, rank, getPointsByRank(rank)));
             previous = record;
         }
+        ranked.forEach(entry -> {
+            gainedByPlayerId.put(entry.player().getId(), entry.gainedPoints());
+            nameByPlayerId.put(entry.player().getId(), entry.player().getName());
+        });
+        Map<Integer, Integer> totals = PlayerPointService.addPointsBatch(gainedByPlayerId, nameByPlayerId);
+
+        // Phase 2: publish, then store the round once everyone's total is final.
+        long finishedAt = System.currentTimeMillis();
+        List<RoundRecord.PlayerResult> results = new ArrayList<>(ranked.size());
         broadcastSystemMessage(MESSAGE_SEPARATOR);
+        broadcastSystemMessage("本轮排名");
+        for (RankedPlayer entry : ranked) {
+            int totalPoints = totals.getOrDefault(entry.player().getId(), 0);
+            broadcastSystemMessage(String.format(
+                    "%d. %s - 分数: %s, 准度: %s%%, 误差: ±%sms, 积分: +%s, 总积分: %s",
+                    entry.rank(),
+                    entry.player().getName(),
+                    entry.record().getScore(),
+                    entry.record().getAccuracy() * 100,
+                    entry.record().getStd() * 1000,
+                    entry.gainedPoints(),
+                    totalPoints
+            ));
+            results.add(new RoundRecord.PlayerResult(
+                    entry.player().getId(),
+                    entry.player().getName(),
+                    entry.rank(),
+                    entry.record().getScore(),
+                    entry.record().getAccuracy(),
+                    entry.record().getStd(),
+                    entry.gainedPoints(),
+                    totalPoints
+            ));
+        }
+        broadcastSystemMessage(MESSAGE_SEPARATOR);
+
+        RoundRecordService.append(new RoundRecord(
+                RoundRecordService.nextId(room.getRoomId(), finishedAt),
+                room.getRoomId(),
+                chart.getId(),
+                chart.getName(),
+                startedAt,
+                finishedAt,
+                List.copyOf(results)
+        ));
+    }
+
+    private record RankedPlayer(Player player, GameRecord record, int rank, int gainedPoints) {
     }
 
     private int compareRecord(GameRecord a, GameRecord b) {

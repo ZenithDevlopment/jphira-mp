@@ -63,6 +63,13 @@ public abstract sealed class RoomGameState implements ProtocolConvertible<GameSt
         }
     }
 
+    /**
+     * Cancels everything this state scheduled. Called when the room is destroyed, so that
+     * pending countdown tasks do not keep the room alive until they fire.
+     */
+    public void dispose() {
+    }
+
     protected void broadcast(Consumer<PlayerOperations> action) {
         room.getPlayerManager().broadcast(action);
     }

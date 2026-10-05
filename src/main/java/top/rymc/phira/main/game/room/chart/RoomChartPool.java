@@ -1,18 +1,19 @@
 package top.rymc.phira.main.game.room.chart;
 
-import java.util.Comparator;
+import top.rymc.phira.main.Server;
+
 import java.util.List;
 
 /**
- * 房间内的固化谱池运行时状态。
+ * Frozen chart pool state inside a room.
  *
- * 房间创建时从全局 pool 定义拷贝选定 pool 的快照形成固化列表，之后不再受全局定义增删影响。
- * 每个房间持有一个实例，负责：
- * - 固化池列表（创建后不可修改）
- * - 当前池、pending pool、已完成轮次计数
- * - 固化列表内按 id 排序循环轮换
+ * Pools are copied from the global definitions at creation time and never change afterwards.
+ * Each room owns one instance, tracking:
+ * - the frozen pool list, in rotation order
+ * - current pool, pending pool, finished round counter
+ * - rotation driven by the pool's own {@code roundsPerStay}, falling back to the room-level interval
  *
- * 状态不持久化，服务重启后房间不保留。
+ * State is not persisted; rooms do not survive a restart.
  */
 public final class RoomChartPool {
 
@@ -22,20 +23,20 @@ public final class RoomChartPool {
     private int finishedRoundsSinceRefresh;
 
     public RoomChartPool(List<ChartPool.PoolSnapshot> pools) {
-        if (pools == null || pools.isEmpty()) {
+        List<ChartPool.PoolSnapshot> usable = pools == null ? List.of()
+                : pools.stream().filter(pool -> pool != null && !pool.chartIds().isEmpty()).toList();
+        if (usable.isEmpty()) {
             throw new IllegalArgumentException("Room chart pool list cannot be empty");
         }
-        this.pools = pools.stream()
-                .sorted(Comparator.comparingInt(ChartPool.PoolSnapshot::id))
-                .toList();
+        this.pools = List.copyOf(usable);
         this.currentPool = this.pools.get(0);
     }
 
     /**
-     * 固化池列表（按 id 排序），只读。
+     * Frozen pool list in rotation order, read-only.
      */
     public synchronized List<ChartPool.PoolSnapshot> getPools() {
-        return List.copyOf(pools);
+        return pools;
     }
 
     public synchronized ChartPool.PoolSnapshot getCurrentPoolSnapshot() {
@@ -51,7 +52,7 @@ public final class RoomChartPool {
     }
 
     /**
-     * 设置 pending pool。目标必须在该房间固化池列表内，不影响当前轮，下一次刷新时生效。
+     * Set the pending pool, taking effect on the next refresh. The target must belong to the frozen list.
      */
     public synchronized void switchPool(int poolId) {
         if (poolById(poolId) == null) {
@@ -61,20 +62,31 @@ public final class RoomChartPool {
     }
 
     /**
-     * 覆盖当前池的 favorite 展示，不写回全局定义。下一轮 SelectChart 快照生效。
+     * Override the current pool's favorite display, without touching the global definition.
+     * Takes effect on the next SelectChart snapshot.
      */
     public synchronized void setFavorite(Integer favoriteId) {
-        currentPool = new ChartPool.PoolSnapshot(currentPool.id(), favoriteId, currentPool.defaultFlag(), currentPool.chartIds());
+        currentPool = new ChartPool.PoolSnapshot(currentPool.id(), favoriteId, currentPool.defaultFlag(), currentPool.chartIds(),
+                currentPool.category(), currentPool.sizeLimit(), currentPool.roundsPerStay(), currentPool.order(),
+                currentPool.submissionOpen());
     }
 
     /**
-     * Playing 结束时调用。达到刷新间隔后在固化列表内推进当前池。
+     * Called when a Playing round ends. Rotates once the pool's own round quota is met.
+     *
+     * @param roomIntervalRounds fallback used when the pool defines no quota
      */
-    public synchronized void finishPlayingRound(int refreshIntervalRounds) {
+    public synchronized void finishPlayingRound(int roomIntervalRounds) {
         finishedRoundsSinceRefresh++;
-        if (finishedRoundsSinceRefresh >= refreshIntervalRounds) {
+        if (finishedRoundsSinceRefresh >= resolveRoundsPerStay(roomIntervalRounds)) {
             refreshCurrentPool();
         }
+    }
+
+    /** Quota of the current pool, falling back to the room-level interval. */
+    public synchronized int resolveRoundsPerStay(int roomIntervalRounds) {
+        Integer quota = currentPool.roundsPerStay();
+        return quota == null || quota < 1 ? roomIntervalRounds : quota;
     }
 
     private void refreshCurrentPool() {
@@ -86,6 +98,7 @@ public final class RoomChartPool {
             currentPool = pools.get((index + 1) % pools.size());
         }
         finishedRoundsSinceRefresh = 0;
+        Server.getLogger().info("Room chart pool rotated to {} ({} rounds finished)", currentPool.id(), currentPool.category());
     }
 
     private ChartPool.PoolSnapshot poolById(int poolId) {

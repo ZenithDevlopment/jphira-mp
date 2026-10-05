@@ -36,6 +36,11 @@ public class GameOperationException extends RuntimeException {
         return new GameOperationException("error.room_already_exists");
     }
 
+    /** Spelled out rather than a message key: the cap is an operator setting, not a game rule. */
+    public static GameOperationException roomLimitReached(int maxRooms) {
+        return new GameOperationException("服务器房间数已达上限（" + maxRooms + "），无法继续创建。");
+    }
+
     public static GameOperationException chartNotSelected() {
         return new GameOperationException("error.chart_not_selected");
     }

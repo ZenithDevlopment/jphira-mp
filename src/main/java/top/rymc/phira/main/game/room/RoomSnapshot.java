@@ -89,10 +89,10 @@ public class RoomSnapshot {
                 runTask(() -> player.operations().ifPresent(operations -> operations.enterState(new WaitForReady())), delay);
             }
 
-            setHost(player, true);
+            setHost(player, isHost(player));
         }
-        public void setHost(Player player, boolean delay) {
-            runTask(() -> player.operations().ifPresent(operations -> operations.updateHostStatus(true)), delay);
+        public void setHost(Player player, boolean value) {
+            runTask(() -> player.operations().ifPresent(operations -> operations.updateHostStatus(value)), true);
         }
 
         private void runTask(Runnable task, boolean delay) {

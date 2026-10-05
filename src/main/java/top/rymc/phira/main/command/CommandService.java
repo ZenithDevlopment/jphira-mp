@@ -9,8 +9,12 @@ import top.rymc.phira.main.game.player.PlayerManager;
 import top.rymc.phira.main.game.room.Room;
 import top.rymc.phira.main.game.room.RoomManager;
 import top.rymc.phira.main.game.room.RoomSnapshot;
+import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
+import top.rymc.phira.main.game.room.chart.PoolCategory;
 import top.rymc.phira.main.game.room.chart.RoomChartPool;
+import top.rymc.phira.main.game.room.chart.ScreeningRule;
+import top.rymc.phira.main.game.room.chart.SubmissionService;
 import top.rymc.phira.main.game.room.local.LocalRoom;
 import top.rymc.phira.main.game.room.local.LocalRoomBuilder;
 import top.rymc.phira.main.game.room.state.RoomGameState;
@@ -23,7 +27,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @RequiredArgsConstructor
 public class CommandService extends SimpleTerminalConsole {
@@ -62,6 +68,16 @@ public class CommandService extends SimpleTerminalConsole {
 
         if (commandName.toLowerCase().startsWith("admin ")) {
             handleAdminCommand(commandName.split("\\s+"));
+            return;
+        }
+
+        if (commandName.toLowerCase().startsWith("chart ")) {
+            handleChartCommand(commandName.split("\\s+"));
+            return;
+        }
+
+        if (commandName.toLowerCase().startsWith("submission ")) {
+            handleSubmissionCommand(commandName.split("\\s+", 5));
             return;
         }
 
@@ -309,8 +325,130 @@ public class CommandService extends SimpleTerminalConsole {
         }
     }
 
-    private void handlePoolCommand(String[] args) {
+    private void handleSubmissionCommand(String[] args) {
         try {
+            if (args.length == 2 && args[1].equalsIgnoreCase("list")) {
+                printSubmissions(SubmissionService.listPending(), "待审投稿");
+                return;
+            }
+
+            if (args.length == 3 && args[1].equalsIgnoreCase("list")) {
+                int poolId = parseInt(args[2]);
+                printSubmissions(SubmissionService.listByPool(poolId, null), "池 " + poolId + " 的投稿");
+                return;
+            }
+
+            if (args.length >= 4 && args[1].equalsIgnoreCase("approve")) {
+                int poolId = parseInt(args[2]);
+                int chartId = parseInt(args[3]);
+                if (!SubmissionService.review(poolId, chartId, true, 0, null)) {
+                    throw new IllegalArgumentException("投稿不存在");
+                }
+                ChartPool.addChart(poolId, chartId);
+                logger.info("Approved chart {} into pool {} from console", chartId, poolId);
+                return;
+            }
+
+            if (args.length >= 4 && args[1].equalsIgnoreCase("reject")) {
+                int poolId = parseInt(args[2]);
+                int chartId = parseInt(args[3]);
+                String reason = args.length > 4 ? args[4] : null;
+                if (!SubmissionService.review(poolId, chartId, false, 0, reason)) {
+                    throw new IllegalArgumentException("投稿不存在");
+                }
+                logger.info("Rejected chart {} in pool {} from console", chartId, poolId);
+                return;
+            }
+
+            logger.warn("Usage: submission list | submission list <poolId> | submission approve <poolId> <chartId> | submission reject <poolId> <chartId> [reason]");
+        } catch (Exception e) {
+            logger.warn("Submission command failed: {}", e.getMessage());
+        }
+    }
+
+    private void printSubmissions(List<SubmissionService.View> views, String title) {
+        if (views.isEmpty()) {
+            logger.info("{}: 无", title);
+            return;
+        }
+        logger.info("{}: {} 条", title, views.size());
+        for (SubmissionService.View view : views) {
+            ChartInfo chart = ChartIndex.get(view.chartId());
+            String name = chart == null ? "-" : chart.getName();
+            String submitters = view.submitters().stream()
+                    .map(submitter -> submitter.name() + "(" + submitter.userId() + ")")
+                    .collect(Collectors.joining(", "));
+            logger.info("  池{} 谱面{} [{}] {} | {} 人: {}", view.poolId(), view.chartId(),
+                    view.status(), name, view.submitters().size(), submitters);
+        }
+    }
+
+    private void handleChartCommand(String[] args) {
+        try {
+            if (args.length == 2 && args[1].equalsIgnoreCase("index")) {
+                logger.info("Chart index holds {} charts (remote total {}, refreshing {})",
+                        ChartIndex.indexedCount(), ChartIndex.remoteCount(), ChartIndex.isRefreshing());
+                return;
+            }
+
+            if ((args.length == 2 || args.length == 3) && args[1].equalsIgnoreCase("refresh")) {
+                String division = args.length == 3 ? args[2] : null;
+                logger.info("Refreshing chart index in background (division={})", division == null ? "all" : division);
+                ChartIndex.refreshAsync(division);
+                return;
+            }
+
+            if (args.length >= 3 && args[1].equalsIgnoreCase("search")) {
+                searchCharts(args[2], args.length > 3 ? args[3] : null);
+                return;
+            }
+
+            if (args.length >= 3 && args[1].equalsIgnoreCase("duration")) {
+                probeDurations(parseChartIds(Arrays.copyOfRange(args, 2, args.length)));
+                return;
+            }
+
+            logger.warn("Usage: chart index | chart refresh [plain] | chart search <category> [limit] | chart duration <chartIds...>");
+        } catch (Exception e) {
+            logger.warn("Chart command failed: {}", e.getMessage());
+        }
+    }
+
+    private void searchCharts(String category, String limit) {
+        PoolCategory parsed = PoolCategory.valueOf(category.trim().toUpperCase(Locale.ROOT));
+        ScreeningRule rule = ScreeningRule.of(parsed);
+        if (rule == null) {
+            throw new IllegalArgumentException("Category has no screening rule: " + parsed);
+        }
+        int max = limit == null ? 20 : parseInt(limit);
+        List<ChartInfo> matched = ChartIndex.search(rule, max);
+        logger.info("{} matched {} of {} indexed charts, showing {}:", parsed, matched.size(),
+                ChartIndex.indexedCount(), matched.size());
+        for (ChartInfo chart : matched) {
+            logger.info("  {} | {} | rating={} votes={} | ID:{}", chart.getName(), chart.getLevel(),
+                    chart.getRating(), chart.getRatingCount(), chart.getId());
+        }
+    }
+
+    private void probeDurations(List<Integer> chartIds) {
+        List<ChartInfo> charts = new ArrayList<>();
+        for (int chartId : chartIds) {
+            ChartInfo chart = ChartIndex.get(chartId);
+            if (chart == null) {
+                throw new IllegalArgumentException("Chart not in index: " + chartId);
+            }
+            charts.add(chart);
+        }
+        int probed = ChartIndex.probeDurations(charts, charts.size());
+        for (ChartInfo chart : charts) {
+            Integer seconds = chart.getDurationSeconds();
+            logger.info("  {} | {} -> {}", chart.getName(), chart.getLevel(),
+                    seconds == null ? "unknown" : seconds + "s");
+        }
+        logger.info("Probed {} of {} chart(s)", probed, chartIds.size());
+    }
+
+    private void handlePoolCommand(String[] args) {        try {
             if (args.length == 2 && args[1].equalsIgnoreCase("list")) {
                 listPools();
                 return;
@@ -348,19 +486,64 @@ public class CommandService extends SimpleTerminalConsole {
                 return;
             }
 
-            logger.warn("Usage: pool list | pool add <id> <chartIds...> | pool remove <id> | pool chart add <poolId> <chartId> | pool chart remove <poolId> <chartId> | pool favorite <poolId> <favoriteId|none> | pool default <poolId> <on|off>");
+            if (args.length >= 4 && args[1].equalsIgnoreCase("meta")) {
+                setPoolMetadata(parseInt(args[2]), args[3], args.length > 4 ? args[4] : null,
+                        args.length > 5 ? args[5] : null, args.length > 6 ? args[6] : null);
+                return;
+            }
+
+            if (args.length >= 3 && args[1].equalsIgnoreCase("generate")) {
+                generatePools(args[2], args.length > 3 ? args[3] : null,
+                        args.length > 4 ? args[4] : null, args.length > 5 ? args[5] : null);
+                return;
+            }
+
+            logger.warn("Usage: pool list | pool add <id> <chartIds...> | pool remove <id> | pool chart add <poolId> <chartId> | pool chart remove <poolId> <chartId> | pool favorite <poolId> <favoriteId|none> | pool default <poolId> <on|off> | pool meta <poolId> <category> [sizeLimit] [roundsPerStay] [order] | pool generate <category> [sizeLimit] [roundsPerStay] [probeDuration]");
         } catch (Exception e) {
             logger.warn("Pool command failed: {}", e.getMessage());
         }
     }
 
+    private void setPoolMetadata(int poolId, String category, String sizeLimit, String roundsPerStay, String order) {
+        PoolCategory parsed = PoolCategory.valueOf(category.trim().toUpperCase(Locale.ROOT));
+        ChartPool.updatePool(poolId, parsed,
+                sizeLimit == null ? null : parseInt(sizeLimit),
+                roundsPerStay == null ? null : parseInt(roundsPerStay),
+                order == null ? null : parseInt(order),
+                // 控制台不开关注投稿开关，交给 Web 面板
+                null);
+        logger.info("Pool {} metadata set: category={} sizeLimit={} roundsPerStay={} order={}",
+                poolId, parsed, sizeLimit, roundsPerStay, order);
+    }
+
+    private void generatePools(String category, String sizeLimit, String roundsPerStay, String probeDuration) {
+        PoolCategory parsed = PoolCategory.valueOf(category.trim().toUpperCase(Locale.ROOT));
+        ScreeningRule rule = ScreeningRule.of(parsed);
+        if (rule == null) {
+            throw new IllegalArgumentException("Category has no screening rule: " + parsed);
+        }
+        if (probeDuration != null) {
+            int budget = parseInt(probeDuration);
+            ScreeningRule relaxed = new ScreeningRule(rule.category(), rule.anyTags(), rule.minRating(),
+                    rule.minRatingCount(), rule.minDifficulty(), null);
+            int probed = ChartIndex.probeDurations(ChartIndex.search(relaxed, budget * 4), budget);
+            logger.info("Probed {} durations for {}", probed, parsed);
+        }
+        try {
+            List<Integer> created = ChartPool.generatePools(rule,
+                    sizeLimit == null ? 15 : parseInt(sizeLimit),
+                    roundsPerStay == null ? null : parseInt(roundsPerStay));
+            logger.info("Generated {} {} pools: {}", created.size(), parsed, created);
+        } catch (IOException e) {
+            throw new IllegalStateException("Pool generation failed: " + e.getMessage(), e);
+        }
+    }
+
     private void listPools() {
         for (ChartPool.PoolSnapshot pool : ChartPool.listPools()) {
-            if (pool.defaultFlag()) {
-                logger.info("Pool {} default favorite_id={}:", pool.id(), pool.favoriteId());
-            } else {
-                logger.info("Pool {} favorite_id={}:", pool.id(), pool.favoriteId());
-            }
+            logger.info("Pool {} category={} default={} order={} sizeLimit={} roundsPerStay={} favorite_id={} charts={}:",
+                    pool.id(), pool.category(), pool.defaultFlag(), pool.order(), pool.sizeLimit(),
+                    pool.roundsPerStay(), pool.favoriteId(), pool.chartIds().size());
             for (int chartId : pool.chartIds()) {
                 ChartInfo chart = ChartPool.getChartInfo(chartId);
                 logger.info("  {} | Lv.{} | ID:{}", chart.getName(), chart.getLevel(), chart.getId());

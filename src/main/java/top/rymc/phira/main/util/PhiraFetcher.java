@@ -16,6 +16,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -61,6 +62,19 @@ public final class PhiraFetcher {
 
     public static ThrowableBiFunction<String, String, LoginResult, IOException> POST_LOGIN =
             PhiraFetcher::fetchLogin;
+
+    /**
+     * One page of the chart list.
+     *
+     * <p>The endpoint serves 30 charts per page and ignores {@code limit}. Only
+     * {@code division=plain} actually filters; any other value behaves as if
+     * no division were given.
+     */
+    public static ChartListPage fetchChartPage(int page, String division) throws IOException {
+        String path = "chart?page=" + page + (division == null || division.isBlank() ? "" : "&division=" + division);
+        HttpRequest request = createRequest(path);
+        return GSON.fromJson(executeWithRetry(request), ChartListPage.class);
+    }
 
     private static HttpClient createHttpClient() {
         return HttpClient.newBuilder()
@@ -184,5 +198,8 @@ public final class PhiraFetcher {
     }
 
     public record LoginResult(int id, String token, String refreshToken, String expireAt) {
+    }
+
+    public record ChartListPage(int count, List<ChartInfo> results) {
     }
 }

@@ -9,12 +9,20 @@ import io.javalin.http.HandlerType;
 import io.javalin.json.JavalinGson;
 import top.rymc.phira.main.Server;
 import top.rymc.phira.main.data.ChartInfo;
+import top.rymc.phira.main.data.RoundRecord;
+import top.rymc.phira.main.game.point.PlayerPointService;
+import top.rymc.phira.main.game.record.RoundRecordService;
+import top.rymc.phira.main.data.UserInfo;
 import top.rymc.phira.main.game.player.PlayerManager;
 import top.rymc.phira.main.game.room.Room;
 import top.rymc.phira.main.game.room.RoomManager;
 import top.rymc.phira.main.game.room.RoomSnapshot;
+import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
+import top.rymc.phira.main.game.room.chart.PoolCategory;
 import top.rymc.phira.main.game.room.chart.RoomChartPool;
+import top.rymc.phira.main.game.room.chart.ScreeningRule;
+import top.rymc.phira.main.game.room.chart.SubmissionService;
 import top.rymc.phira.main.game.room.local.LocalRoom;
 import top.rymc.phira.main.game.room.local.LocalRoomBuilder;
 import top.rymc.phira.main.game.room.state.RoomGameState;
@@ -30,7 +38,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.regex.Pattern;
 
@@ -47,6 +57,19 @@ public final class ApiServer {
 
     private static final Pattern ROOM_ID_PATTERN = Pattern.compile("[A-Za-z0-9_-]{1,20}");
     private static final CountDownLatch STARTED = new CountDownLatch(1);
+    private static final int DEFAULT_POOL_SIZE = 15;
+    /** Upper bound on a single chart search response. */
+    private static final int MAX_SEARCH_LIMIT = 500;
+    /** Upper bound on one submission call, so a player cannot flood the review queue. */
+    private static final int MAX_SUBMIT_BATCH = 20;
+    /** Sender id clients render as a system message rather than a player. */
+    private static final int SYSTEM_SENDER_ID = -1;
+    private static final int MAX_CHAT_LENGTH = 200;
+    /** Upper bound for any page size, so one request cannot pull the whole history. */
+    private static final int MAX_PAGE_SIZE = 200;
+    /** Duration probes hit the network, so a single request may only ask for a few. */
+    private static final int MAX_PROBE_BATCH = 20;
+    private static volatile String startupFailure;
 
     private ApiServer() {
     }
@@ -57,7 +80,10 @@ public final class ApiServer {
                 Javalin.create(ApiServer::configure).start(host, port);
                 Server.getLogger().info("HTTP API server listening on {}:{}", host, port);
             } catch (Exception e) {
-                Server.getLogger().error("Failed to start HTTP API server", e);
+                // The web manager is the only way to configure pools, so a silent failure here
+                // would leave the operator with a running game server and no control panel.
+                startupFailure = "HTTP API server failed to bind " + host + ":" + port;
+                Server.getLogger().error(startupFailure, e);
             } finally {
                 STARTED.countDown();
             }
@@ -74,6 +100,11 @@ public final class ApiServer {
             STARTED.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        if (startupFailure != null) {
+            throw new IllegalStateException(startupFailure
+                    + "; the game port is up but the web manager is unreachable. "
+                    + "Free the port or pass a different --http-port.");
         }
     }
 
@@ -94,17 +125,44 @@ public final class ApiServer {
         config.routes.get("/api/v1/room/{id}", ApiServer::handleRoomGet);
         config.routes.delete("/api/v1/room/{id}", ApiServer::handleRoomDelete);
         config.routes.post("/api/v1/room/{id}/end", ApiServer::handleRoomEnd);
+        config.routes.post("/api/v1/room/{id}/say", ApiServer::handleRoomSay);
+        config.routes.post("/api/v1/broadcast", ApiServer::handleBroadcast);
         config.routes.get("/api/v1/room/{id}/pool", ApiServer::handleRoomPoolGet);
         config.routes.put("/api/v1/room/{id}/pool/switch", ApiServer::handleRoomPoolSwitch);
         config.routes.put("/api/v1/room/{id}/pool/favorite", ApiServer::handleRoomPoolFavorite);
 
         config.routes.get("/api/v1/pool/list", ApiServer::handlePoolList);
         config.routes.post("/api/v1/pool", ApiServer::handlePoolCreate);
+        config.routes.post("/api/v1/pool/batch", ApiServer::handlePoolBatchCreate);
         config.routes.delete("/api/v1/pool/{id}", ApiServer::handlePoolRemove);
+        config.routes.put("/api/v1/pool/{id}", ApiServer::handlePoolUpdate);
         config.routes.post("/api/v1/pool/{id}/chart", ApiServer::handlePoolChartAdd);
+        config.routes.post("/api/v1/pool/{id}/charts", ApiServer::handlePoolChartAddBatch);
         config.routes.delete("/api/v1/pool/{id}/chart/{chartId}", ApiServer::handlePoolChartRemove);
         config.routes.put("/api/v1/pool/{id}/favorite", ApiServer::handlePoolFavorite);
         config.routes.put("/api/v1/pool/{id}/default", ApiServer::handlePoolDefault);
+        // 投稿：玩家侧只需登录，审核侧需管理员
+        config.routes.post("/api/v1/pool/{id}/submissions", ApiServer::handleSubmitCharts);
+        config.routes.get("/api/v1/pool/{id}/submissions", ApiServer::handlePoolSubmissions);
+        config.routes.delete("/api/v1/pool/{id}/submissions/{chartId}", ApiServer::handleSubmissionWithdraw);
+        config.routes.get("/api/v1/submission/open-pools", ApiServer::handleOpenPools);
+        config.routes.get("/api/v1/submission/mine", ApiServer::handleMySubmissions);
+        config.routes.get("/api/v1/submission/pending", ApiServer::handlePendingSubmissions);
+        config.routes.post("/api/v1/submission/{poolId}/{chartId}/approve", ApiServer::handleSubmissionApprove);
+        config.routes.post("/api/v1/submission/{poolId}/{chartId}/reject", ApiServer::handleSubmissionReject);
+
+        config.routes.get("/api/v1/chart/search", ApiServer::handleChartSearch);
+        config.routes.post("/api/v1/pool/generate", ApiServer::handlePoolGenerate);
+        config.routes.post("/api/v1/chart/duration", ApiServer::handleChartDurationProbe);
+        config.routes.get("/api/v1/admin", ApiServer::handleAdminList);
+        config.routes.post("/api/v1/admin", ApiServer::handleAdminAdd);
+        config.routes.delete("/api/v1/admin/{userId}", ApiServer::handleAdminRemove);
+
+        // 比赛记录：具体路径先于 /record/{id} 注册
+        config.routes.get("/api/v1/record/list", ApiServer::handleRecordList);
+        config.routes.get("/api/v1/record/player/{playerId}", ApiServer::handlePlayerRecords);
+        config.routes.get("/api/v1/record/{id}", ApiServer::handleRecordGet);
+        config.routes.get("/api/v1/point/ranking", ApiServer::handlePointRanking);
 
         // 前端静态资源与 SPA 路由 fallback（API 具体路由优先匹配，通配在此兜底）
         config.routes.get("/", ApiServer::serveFrontend);
@@ -301,13 +359,9 @@ public final class ApiServer {
                 throw new ApiException(400, "当前没有默认启用的谱池");
             }
         } else {
-            pools = new ArrayList<>();
-            for (int poolId : body.pools()) {
-                ChartPool.PoolSnapshot pool = ChartPool.findPool(poolId);
-                if (pool == null) {
-                    throw new ApiException(400, "谱池不存在：" + poolId);
-                }
-                pools.add(pool);
+            pools = ChartPool.resolvePools(body.pools());
+            if (pools.isEmpty()) {
+                throw new ApiException(400, "指定的谱池不存在或均为空池");
             }
         }
 
@@ -407,7 +461,9 @@ public final class ApiServer {
         if (!room.getView().getPlayers().isEmpty() || !room.getView().getMonitors().isEmpty()) {
             throw new ApiException(400, "房间非空，无法删除");
         }
-        RoomManager.removeRoom(room.getRoomId());
+        // destroy() and not just removeRoom(): the state's countdown tasks would keep
+        // running against a room nobody can reach any more.
+        room.destroy();
         Server.getLogger().info("HTTP delete room: {}", room.getRoomId());
         ctx.json(Map.of("ok", true));
     }
@@ -421,6 +477,132 @@ public final class ApiServer {
         state.forceFinishByServer();
         Server.getLogger().info("HTTP force end room: {}", room.getRoomId());
         ctx.json(Map.of("ok", true));
+    }
+
+    /** Pushes an operator message into one room; clients render it as a system message. */
+    private static void handleRoomSay(Context ctx) {
+        requireAdmin(ctx);
+        LocalRoom room = requireRoom(ctx.pathParam("id"));
+        String message = requireSayMessage(ctx);
+        room.getPlayerManager().broadcast(op -> op.receiveChat(SYSTEM_SENDER_ID, message));
+        Server.getLogger().info("HTTP room message to {}: {}", room.getRoomId(), message);
+        ctx.json(Map.of("ok", true, "delivered", room.getPlayerManager().getPlayersCopy().size()));
+    }
+
+    /** Pushes an operator message to every online player. */
+    private static void handleBroadcast(Context ctx) {
+        requireAdmin(ctx);
+        String message = requireSayMessage(ctx);
+        PlayerManager.getOnlinePlayers()
+                .forEach(player -> player.operations().ifPresent(op -> op.receiveChat(SYSTEM_SENDER_ID, message)));
+        Server.getLogger().info("HTTP global message: {}", message);
+        ctx.json(Map.of("ok", true, "delivered", PlayerManager.getOnlinePlayers().size()));
+    }
+
+    private static String requireSayMessage(Context ctx) {
+        SayBody body = bodyOrNull(ctx, SayBody.class);
+        if (body == null || body.message() == null || body.message().isBlank()) {
+            throw new ApiException(400, "消息不能为空");
+        }
+        // Line breaks would let an operator message forge extra chat bubbles.
+        String message = body.message().strip().replaceAll("[\\r\\n]+", " ");
+        // Players see this unthrottled, so keep it to something a chat line can hold.
+        return message.length() > MAX_CHAT_LENGTH ? message.substring(0, MAX_CHAT_LENGTH) : message;
+    }
+
+    // ===== 比赛记录 =====
+
+    /** Newest first; {@code roomId} and {@code playerId} narrow the result. */
+    private static void handleRecordList(Context ctx) {
+        requireAdmin(ctx);
+        int limit = queryLimit(ctx);
+        int offset = Math.max(0, (int) queryDouble(ctx, "offset", 0));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", RoundRecordService.size());
+        result.put("records", RoundRecordService.query(limit, offset,
+                        blankToNull(ctx.queryParam("roomId")), queryIntOrNull(ctx, "playerId"))
+                .stream().map(ApiServer::recordJson).toList());
+        ctx.json(Map.of("ok", true, "result", result));
+    }
+
+    private static void handleRecordGet(Context ctx) {
+        requireAdmin(ctx);
+        RoundRecord record = RoundRecordService.find(ctx.pathParam("id"))
+                .orElseThrow(() -> new ApiException(404, "记录不存在"));
+        ctx.json(Map.of("ok", true, "record", recordJson(record)));
+    }
+
+    private static void handlePlayerRecords(Context ctx) {
+        requireAdmin(ctx);
+        int playerId = pathInt(ctx, "playerId");
+        ctx.json(Map.of("ok", true, "result", Map.of(
+                "playerId", playerId,
+                "rounds", RoundRecordService.byPlayer(playerId, queryLimit(ctx))
+                        .stream().map(ApiServer::playerRoundJson).toList()
+        )));
+    }
+
+    private static void handlePointRanking(Context ctx) {
+        requireAdmin(ctx);
+        ctx.json(Map.of("ok", true, "ranking", PlayerPointService.getRankingSnapshot(queryLimit(ctx))
+                .stream().map(ApiServer::rankEntryJson).toList()));
+    }
+
+    // Stored as snake_case on disk, but the HTTP contract is camelCase like every other endpoint.
+
+    private static Map<String, Object> recordJson(RoundRecord record) {
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("id", record.id());
+        json.put("roomId", record.roomId());
+        json.put("chartId", record.chartId());
+        json.put("chartName", record.chartName());
+        json.put("startedAt", record.startedAt());
+        json.put("finishedAt", record.finishedAt());
+        json.put("results", record.results().stream().map(ApiServer::playerResultJson).toList());
+        return json;
+    }
+
+    private static Map<String, Object> playerRoundJson(RoundRecord.PlayerRound round) {
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("recordId", round.recordId());
+        json.put("roomId", round.roomId());
+        json.put("chartId", round.chartId());
+        json.put("chartName", round.chartName());
+        json.put("finishedAt", round.finishedAt());
+        json.put("result", playerResultJson(round.result()));
+        return json;
+    }
+
+    private static Map<String, Object> playerResultJson(RoundRecord.PlayerResult result) {
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("playerId", result.playerId());
+        json.put("playerName", result.playerName());
+        json.put("rank", result.rank());
+        json.put("score", result.score());
+        json.put("accuracy", result.accuracy());
+        json.put("std", result.std());
+        json.put("gainedPoints", result.gainedPoints());
+        json.put("totalPoints", result.totalPoints());
+        return json;
+    }
+
+    private static Map<String, Object> rankEntryJson(PlayerPointService.RankEntry entry) {
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("playerId", entry.playerId());
+        json.put("name", entry.name());
+        json.put("points", entry.points());
+        json.put("rank", entry.rank());
+        return json;
+    }
+
+    private static int queryLimit(Context ctx) {
+        return Math.max(1, Math.min(MAX_PAGE_SIZE, (int) queryDouble(ctx, "limit", 50)));
+    }
+
+    private static Integer queryIntOrNull(Context ctx, String name) {
+        Double value = queryNumber(ctx, name);
+        return value == null ? null : value.intValue();
     }
 
     private static void handleRoomPoolGet(Context ctx) {
@@ -468,16 +650,50 @@ public final class ApiServer {
     private static void handlePoolCreate(Context ctx) {
         requireAdmin(ctx);
         PoolCreateBody body = bodyOrNull(ctx, PoolCreateBody.class);
-        if (body == null || body.chartIds() == null || body.chartIds().isEmpty()) {
+        if (body == null) {
             throw new ApiException(400, "请检查是否传入了错误的格式");
         }
         try {
-            ChartPool.addPool(body.id(), body.chartIds());
+            ChartPool.addPool(body.id(), body.chartIds() == null ? List.of() : body.chartIds(),
+                    body.category(), body.sizeLimit(), body.roundsPerStay());
         } catch (Exception e) {
             throw new ApiException(400, e.getMessage());
         }
         Server.getLogger().info("HTTP create pool: {} charts={}", body.id(), body.chartIds());
         ctx.json(Map.of("ok", true));
+    }
+
+    private static void handlePoolUpdate(Context ctx) {
+        requireAdmin(ctx);
+        int poolId = pathInt(ctx, "id");
+        PoolUpdateBody body = bodyOrNull(ctx, PoolUpdateBody.class);
+        if (body == null) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        try {
+            ChartPool.updatePool(poolId, body.category(), body.sizeLimit(), body.roundsPerStay(),
+                    body.order(), body.submissionOpen());
+        } catch (Exception e) {
+            throw new ApiException(400, e.getMessage());
+        }
+        Server.getLogger().info("HTTP update pool {}: category={} sizeLimit={} roundsPerStay={} order={} submissionOpen={}",
+                poolId, body.category(), body.sizeLimit(), body.roundsPerStay(), body.order(), body.submissionOpen());
+        ctx.json(Map.of("ok", true));
+    }
+
+    private static void handlePoolBatchCreate(Context ctx) {
+        requireAdmin(ctx);
+        PoolBatchBody body = bodyOrNull(ctx, PoolBatchBody.class);
+        if (body == null || body.count() < 1) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        try {
+            List<Integer> created = ChartPool.createEmptyPools(body.count(), body.category(),
+                    body.sizeLimit(), body.roundsPerStay());
+            ctx.json(Map.of("ok", true, "poolIds", created));
+        } catch (Exception e) {
+            throw new ApiException(400, e.getMessage());
+        }
     }
 
     private static void handlePoolRemove(Context ctx) {
@@ -506,6 +722,22 @@ public final class ApiServer {
         }
         Server.getLogger().info("HTTP add chart {} to pool {}", body.chartId(), poolId);
         ctx.json(Map.of("ok", true));
+    }
+
+    private static void handlePoolChartAddBatch(Context ctx) {
+        requireAdmin(ctx);
+        int poolId = pathInt(ctx, "id");
+        ChartAddBatchBody body = bodyOrNull(ctx, ChartAddBatchBody.class);
+        if (body == null || body.chartIds() == null || body.chartIds().isEmpty()) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        try {
+            int added = ChartPool.addCharts(poolId, body.chartIds());
+            Server.getLogger().info("HTTP add {} charts to pool {} (requested {})", added, poolId, body.chartIds().size());
+            ctx.json(Map.of("ok", true, "added", added));
+        } catch (Exception e) {
+            throw new ApiException(400, e.getMessage());
+        }
     }
 
     private static void handlePoolChartRemove(Context ctx) {
@@ -540,6 +772,347 @@ public final class ApiServer {
         ChartPool.setDefaultFlag(poolId, body.enabled());
         Server.getLogger().info("HTTP pool {} default set to {}", poolId, body.enabled());
         ctx.json(Map.of("ok", true));
+    }
+
+    // ===== 谱面筛选与池生成 =====
+
+    private static void handleChartSearch(Context ctx) {
+        requireAdmin(ctx);
+        if (ctx.queryParam("refresh") != null) {
+            ChartIndex.refreshAsync(blankToNull(ctx.queryParam("division")));
+        }
+        ScreeningRule rule = ruleFromQuery(ctx);
+        int limit = (int) Math.min(Math.max(1, queryDouble(ctx, "limit", 50)), MAX_SEARCH_LIMIT);
+        Double probeBudget = queryNumber(ctx, "probeDuration");
+        if (probeBudget != null && probeBudget > 0) {
+            probeDurationsFor(rule, probeBudget.intValue());
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("indexed", ChartIndex.indexedCount());
+        result.put("remoteTotal", ChartIndex.remoteCount());
+        result.put("refreshing", ChartIndex.isRefreshing());
+        result.put("matched", ChartIndex.countMatches(rule));
+        // TB gates on a duration that is only known after probing, so an empty result
+        // usually means "not probed yet" rather than "nothing qualifies".
+        result.put("pendingDuration", rule.minDurationSeconds() != null
+                && ChartIndex.countMatches(withoutDuration(rule)) > 0);
+        result.put("charts", ChartIndex.search(rule, limit).stream().map(ApiServer::chartInfo).toList());
+        ctx.json(Map.of("ok", true, "result", result));
+    }
+
+    /** Same rule with the duration bound dropped, used to report what probing would unlock. */
+    private static ScreeningRule withoutDuration(ScreeningRule rule) {
+        return new ScreeningRule(rule.category(), rule.anyTags(), rule.minRating(),
+                rule.minRatingCount(), rule.minDifficulty(), null);
+    }
+
+    private static void handlePoolGenerate(Context ctx) {
+        requireAdmin(ctx);
+        PoolGenerateBody body = bodyOrNull(ctx, PoolGenerateBody.class);
+        if (body == null || body.category() == null) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        if (body.probeDuration() != null && body.probeDuration() > MAX_PROBE_BATCH) {
+            throw new ApiException(400, "一次最多探测 " + MAX_PROBE_BATCH + " 张谱面");
+        }
+        ScreeningRule rule = ScreeningRule.of(body.category());
+        if (rule == null) {
+            throw new ApiException(400, "该类别不支持规则生成");
+        }
+        if (body.probeDuration() != null && body.probeDuration() > 0) {
+            probeDurationsFor(rule, body.probeDuration());
+        }
+        try {
+            List<Integer> created = ChartPool.generatePools(rule,
+                    body.sizeLimit() == null ? DEFAULT_POOL_SIZE : body.sizeLimit(), body.roundsPerStay());
+            ctx.json(Map.of("ok", true, "poolIds", created));
+        } catch (IOException e) {
+            throw new ApiException(400, e.getMessage());
+        }
+    }
+
+    private static void handleChartDurationProbe(Context ctx) {
+        requireAdmin(ctx);
+        ChartDurationBody body = bodyOrNull(ctx, ChartDurationBody.class);
+        if (body == null || body.chartIds() == null || body.chartIds().isEmpty()) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        // Each probe costs a couple of network round trips, so cap the batch instead of
+        // letting one request hold the HTTP thread for minutes.
+        if (body.chartIds().size() > MAX_PROBE_BATCH) {
+            throw new ApiException(400, "一次最多探测 " + MAX_PROBE_BATCH + " 张谱面");
+        }
+        List<ChartInfo> charts = new ArrayList<>();
+        for (int chartId : body.chartIds()) {
+            ChartInfo chart = ChartIndex.get(chartId);
+            if (chart != null) {
+                charts.add(chart);
+            }
+        }
+        ctx.json(Map.of("ok", true, "probed", ChartIndex.probeDurations(charts, charts.size()),
+                "charts", charts.stream().map(ApiServer::chartInfo).toList()));
+    }
+
+    /**
+     * Durations are unknown until probed, so the duration bound is dropped while
+     * candidates are collected and only then applied.
+     */
+    private static void probeDurationsFor(ScreeningRule rule, int budget) {
+        if (rule.minDurationSeconds() == null) {
+            return;
+        }
+        ScreeningRule relaxed = withoutDuration(rule);
+        int capped = Math.min(budget, ChartIndex.MAX_PROBE_BUDGET);
+        // Candidates outnumber probes: long charts are a minority of the high rated set.
+        int probed = ChartIndex.probeDurations(ChartIndex.search(relaxed, capped * 4), capped);
+        Server.getLogger().info("Probed {} durations for {} (budget {})", probed, rule.category(), capped);
+    }
+
+    private static ScreeningRule ruleFromQuery(Context ctx) {
+        PoolCategory category = queryCategory(ctx);
+        ScreeningRule preset = category == null ? null : ScreeningRule.of(category);
+        String tag = ctx.queryParam("tag");
+        Double minDifficulty = queryNumber(ctx, "minDifficulty");
+        Double minDuration = queryNumber(ctx, "minDuration");
+
+        // Kept as explicit branches: mixing a primitive with a nullable field would unbox null.
+        Double difficultyBound = minDifficulty != null ? minDifficulty
+                : preset == null ? null : preset.minDifficulty();
+        Integer durationBound = null;
+        if (minDuration != null) {
+            durationBound = minDuration.intValue();
+        } else if (preset != null) {
+            durationBound = preset.minDurationSeconds();
+        }
+
+        return new ScreeningRule(
+                category == null ? PoolCategory.MANUAL : category,
+                tag == null || tag.isBlank()
+                        ? (preset == null ? Set.of() : preset.anyTags())
+                        : Set.of(tag.split(",")),
+                (float) queryDouble(ctx, "minRating", preset == null ? 0 : preset.minRating()),
+                (int) queryDouble(ctx, "minRatingCount", preset == null ? 0 : preset.minRatingCount()),
+                difficultyBound,
+                durationBound);
+    }
+
+    // ===== 谱面投稿 =====
+
+    /** Pools players may submit into. Any signed-in user may call this. */
+    private static void handleOpenPools(Context ctx) {
+        requireUser(ctx);
+        ctx.json(Map.of("ok", true, "pools", ChartPool.listOpenForSubmission().stream()
+                .map(ApiServer::poolSnapshot).toList()));
+    }
+
+    /** Backs one or more charts in a single pool. Login is enough; the pool must be open. */
+    private static void handleSubmitCharts(Context ctx) {
+        int userId = requireUser(ctx);
+        int poolId = pathInt(ctx, "id");
+        SubmitBody body = bodyOrNull(ctx, SubmitBody.class);
+        if (body == null || body.chartIds() == null || body.chartIds().isEmpty()) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        if (body.chartIds().size() > MAX_SUBMIT_BATCH) {
+            throw new ApiException(400, "一次最多投稿 " + MAX_SUBMIT_BATCH + " 张谱面");
+        }
+
+        ChartPool.PoolSnapshot pool = ChartPool.findPool(poolId);
+        if (pool == null) {
+            throw new ApiException(404, "谱池不存在");
+        }
+        if (!pool.submissionOpen()) {
+            throw new ApiException(400, "该谱池未开启投稿");
+        }
+        // Reject unknown charts here rather than letting approval fail later.
+        List<Integer> unknown = body.chartIds().stream().filter(id -> ChartIndex.get(id) == null).toList();
+        if (!unknown.isEmpty()) {
+            throw new ApiException(400, "这些谱面不在索引里，无法投稿：" + unknown);
+        }
+
+        List<Map<String, Object>> results = SubmissionService
+                .submit(poolId, body.chartIds(), userId, resolvePlayerName(userId)).stream()
+                .map(result -> {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("chartId", result.chartId());
+                    item.put("accepted", result.accepted());
+                    item.put("reason", result.reason());
+                    return item;
+                })
+                .toList();
+        long accepted = results.stream().filter(item -> Boolean.TRUE.equals(item.get("accepted"))).count();
+        Server.getLogger().info("HTTP submission: user {} backed {} chart(s) in pool {} (accepted {})",
+                userId, body.chartIds().size(), poolId, accepted);
+        ctx.json(Map.of("ok", true, "accepted", accepted, "results", results));
+    }
+
+    /** Reviewers see every submission of a pool; supports an optional status filter. */
+    private static void handlePoolSubmissions(Context ctx) {
+        requireAdmin(ctx);
+        int poolId = pathInt(ctx, "id");
+        SubmissionService.Status filter = parseSubmissionStatus(ctx.queryParam("status"));
+        ctx.json(Map.of("ok", true, "submissions",
+                SubmissionService.listByPool(poolId, filter).stream().map(ApiServer::submissionView).toList()));
+    }
+
+    /** Charts this player backed, across every pool. */
+    private static void handleMySubmissions(Context ctx) {
+        int userId = requireUser(ctx);
+        ctx.json(Map.of("ok", true, "submissions",
+                SubmissionService.listBySubmitter(userId).stream().map(ApiServer::submissionView).toList()));
+    }
+
+    /** Cross-pool review queue. */
+    private static void handlePendingSubmissions(Context ctx) {
+        requireAdmin(ctx);
+        ctx.json(Map.of("ok", true, "submissions",
+                SubmissionService.listPending().stream().map(ApiServer::submissionView).toList()));
+    }
+
+    /** Approving also lands the chart in the pool, which is idempotent. */
+    private static void handleSubmissionApprove(Context ctx) {
+        int reviewerId = requireAdmin(ctx);
+        int poolId = pathInt(ctx, "poolId");
+        int chartId = pathInt(ctx, "chartId");
+        if (!SubmissionService.review(poolId, chartId, true, reviewerId, null)) {
+            throw new ApiException(404, "投稿不存在");
+        }
+        try {
+            ChartPool.addChart(poolId, chartId);
+        } catch (Exception e) {
+            throw new ApiException(400, "已标记通过，但加入谱池失败：" + e.getMessage());
+        }
+        Server.getLogger().info("HTTP submission approved: pool {} chart {} by {}", poolId, chartId, reviewerId);
+        ctx.json(Map.of("ok", true));
+    }
+
+    private static void handleSubmissionReject(Context ctx) {
+        int reviewerId = requireAdmin(ctx);
+        int poolId = pathInt(ctx, "poolId");
+        int chartId = pathInt(ctx, "chartId");
+        RejectBody body = bodyOrNull(ctx, RejectBody.class);
+        if (!SubmissionService.review(poolId, chartId, false, reviewerId, body == null ? null : body.reason())) {
+            throw new ApiException(404, "投稿不存在");
+        }
+        Server.getLogger().info("HTTP submission rejected: pool {} chart {} by {}", poolId, chartId, reviewerId);
+        ctx.json(Map.of("ok", true));
+    }
+
+    /** A player withdraws their own backing; approved entries cannot be pulled back. */
+    private static void handleSubmissionWithdraw(Context ctx) {
+        int userId = requireUser(ctx);
+        int poolId = pathInt(ctx, "id");
+        int chartId = pathInt(ctx, "chartId");
+        if (!SubmissionService.withdraw(poolId, chartId, userId)) {
+            throw new ApiException(400, "无法撤回：没有投过这张谱面，或它已经通过审核");
+        }
+        ctx.json(Map.of("ok", true));
+    }
+
+    private static SubmissionService.Status parseSubmissionStatus(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return SubmissionService.Status.valueOf(raw.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(400, "未知状态：" + raw);
+        }
+    }
+
+    /** Falls back to a placeholder when Phira cannot be reached, so submission never blocks on it. */
+    private static String resolvePlayerName(int userId) {
+        try {
+            UserInfo info = PhiraFetcher.GET_USER_INFO_BY_ID.apply(userId);
+            return info != null && info.getName() != null ? info.getName() : ("用户 " + userId);
+        } catch (IOException e) {
+            return "用户 " + userId;
+        }
+    }
+
+    private static Map<String, Object> submissionView(SubmissionService.View view) {
+        Map<String, Object> info = new LinkedHashMap<>();
+        info.put("poolId", view.poolId());
+        info.put("chartId", view.chartId());
+        info.put("status", view.status().name());
+        ChartInfo chart = ChartIndex.get(view.chartId());
+        info.put("chart", chart == null ? null : chartInfo(chart));
+        info.put("submitterCount", view.submitters().size());
+        info.put("submitters", view.submitters().stream().map(submitter -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("userId", submitter.userId());
+            item.put("name", submitter.name() == null ? "" : submitter.name());
+            item.put("at", submitter.at() == null ? null : submitter.at().toString());
+            return item;
+        }).toList());
+        info.put("createdAt", view.createdAt() == null ? null : view.createdAt().toString());
+        info.put("reviewedAt", view.reviewedAt() == null ? null : view.reviewedAt().toString());
+        info.put("reviewerId", view.reviewerId());
+        info.put("reason", view.reason());
+        return info;
+    }
+
+    // ===== 管理员名单 =====
+
+    private static void handleAdminList(Context ctx) {
+        requireAdmin(ctx);
+        ctx.json(Map.of("ok", true, "admins", AdminService.getAdmins()));
+    }
+
+    private static void handleAdminAdd(Context ctx) {
+        requireAdmin(ctx);
+        AdminBody body = bodyOrNull(ctx, AdminBody.class);
+        if (body == null || body.userId() <= 0) {
+            throw new ApiException(400, "请检查是否传入了错误的格式");
+        }
+        boolean added = AdminService.addAdmin(body.userId());
+        Server.getLogger().info("HTTP admin add: {} ({} now)", body.userId(), AdminService.getAdmins().size());
+        ctx.json(Map.of("ok", true, "added", added, "admins", AdminService.getAdmins()));
+    }
+
+    private static void handleAdminRemove(Context ctx) {
+        requireAdmin(ctx);
+        int userId = pathInt(ctx, "userId");
+        if (AdminService.getAdmins().size() <= 1) {
+            throw new ApiException(400, "至少保留一名管理员");
+        }
+        boolean removed = AdminService.removeAdmin(userId);
+        Server.getLogger().info("HTTP admin remove: {} ({} left)", userId, AdminService.getAdmins().size());
+        ctx.json(Map.of("ok", true, "removed", removed, "admins", AdminService.getAdmins()));
+    }
+
+    private static PoolCategory queryCategory(Context ctx) {
+        String raw = ctx.queryParam("category");
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return PoolCategory.valueOf(raw.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(400, "未知类别：" + raw);
+        }
+    }
+
+    private static double queryDouble(Context ctx, String name, double fallback) {
+        Double parsed = queryNumber(ctx, name);
+        return parsed == null ? fallback : parsed;
+    }
+
+    private static Double queryNumber(Context ctx, String name) {
+        String raw = ctx.queryParam(name);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException e) {
+            throw new ApiException(400, "参数格式错误：" + name);
+        }
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     // ===== 辅助 =====
@@ -640,6 +1213,7 @@ public final class ApiServer {
         info.put("created", chart.getCreated());
         info.put("updated", chart.getUpdated());
         info.put("chartUpdated", chart.getChartUpdated());
+        info.put("durationSeconds", chart.getDurationSeconds());
         return info;
     }
 
@@ -674,6 +1248,7 @@ public final class ApiServer {
         status.put("favoriteId", current.favoriteId());
         status.put("finishedRoundsSinceRefresh", pool.getFinishedRoundsSinceRefresh());
         status.put("refreshIntervalRounds", room.getSetting().getRefreshIntervalRounds());
+        status.put("effectiveRoundsPerStay", pool.resolveRoundsPerStay(room.getSetting().getRefreshIntervalRounds()));
         return status;
     }
 
@@ -683,6 +1258,11 @@ public final class ApiServer {
         snapshot.put("favoriteId", pool.favoriteId());
         snapshot.put("default", pool.defaultFlag());
         snapshot.put("chartIds", pool.chartIds());
+        snapshot.put("category", pool.category() == null ? null : pool.category().name());
+        snapshot.put("sizeLimit", pool.sizeLimit());
+        snapshot.put("roundsPerStay", pool.roundsPerStay());
+        snapshot.put("order", pool.order());
+        snapshot.put("submissionOpen", pool.submissionOpen());
         return snapshot;
     }
 
@@ -725,12 +1305,47 @@ public final class ApiServer {
     public record FavoriteBody(@SerializedName("favoriteId") Integer favoriteId) {
     }
 
-    public record PoolCreateBody(int id, @SerializedName("chartIds") List<Integer> chartIds) {
+    public record PoolCreateBody(int id, @SerializedName("chartIds") List<Integer> chartIds,
+                                 PoolCategory category, @SerializedName("sizeLimit") Integer sizeLimit,
+                                 @SerializedName("roundsPerStay") Integer roundsPerStay) {
     }
 
     public record ChartAddBody(@SerializedName("chartId") int chartId) {
     }
 
+    public record ChartAddBatchBody(@SerializedName("chartIds") List<Integer> chartIds) {
+    }
+
+    public record PoolUpdateBody(PoolCategory category, @SerializedName("sizeLimit") Integer sizeLimit,
+                                 @SerializedName("roundsPerStay") Integer roundsPerStay, Integer order,
+                                 @SerializedName("submissionOpen") Boolean submissionOpen) {
+    }
+
     public record PoolDefaultBody(boolean enabled) {
+    }
+
+    public record PoolGenerateBody(PoolCategory category, @SerializedName("sizeLimit") Integer sizeLimit,
+                                   @SerializedName("roundsPerStay") Integer roundsPerStay,
+                                   @SerializedName("probeDuration") Integer probeDuration) {
+    }
+
+    public record ChartDurationBody(@SerializedName("chartIds") List<Integer> chartIds) {
+    }
+
+    public record AdminBody(@SerializedName("userId") int userId) {
+    }
+
+    public record PoolBatchBody(int count, PoolCategory category,
+                                @SerializedName("sizeLimit") Integer sizeLimit,
+                                @SerializedName("roundsPerStay") Integer roundsPerStay) {
+    }
+
+    public record SubmitBody(@SerializedName("chartIds") List<Integer> chartIds) {
+    }
+
+    public record RejectBody(String reason) {
+    }
+
+    public record SayBody(String message) {
     }
 }

@@ -3,7 +3,9 @@ package top.rymc.phira.main;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
@@ -21,7 +23,12 @@ import top.rymc.phira.main.config.ServerArgs;
 import top.rymc.phira.main.game.player.Player;
 import top.rymc.phira.main.game.player.PlayerManager;
 import top.rymc.phira.main.game.i18n.I18nService;
+import top.rymc.phira.main.game.point.PlayerPointService;
+import top.rymc.phira.main.game.record.RoundRecordService;
+import top.rymc.phira.main.game.room.RoomManager;
+import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
+import top.rymc.phira.main.game.room.chart.SubmissionService;
 import top.rymc.phira.main.http.ApiServer;
 import top.rymc.phira.main.network.ServerChannelInitializer;
 import top.rymc.phira.main.util.ExecutorServiceManager;
@@ -94,6 +101,17 @@ public class Server {
         ChartPool.preload();
         logger.info("Chart pool preloaded.");
 
+        // Cached catalogue only; a full sweep is triggered on demand from the web manager.
+        ChartIndex.preload();
+        logger.info("Chart index loaded: {} charts", ChartIndex.indexedCount());
+
+        SubmissionService.preload();
+        RoundRecordService.preload();
+        logger.info("Round records loaded: {}", RoundRecordService.size());
+
+        // Rooms created from the console or web manager never self destroy, so reap the idle ones.
+        RoomManager.startWatchdog();
+
         ApiServer.start(args.getHttpHost(), args.getHttpPort());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -111,6 +129,9 @@ public class Server {
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(bossGroup, workerGroup)
                 .channel(NioServerSocketChannel.class)
+                // Pause reading from a client whose outbound buffer fills up, instead of growing it.
+                .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
+                        new WriteBufferWaterMark(512 * 1024, 2 * 1024 * 1024))
                 .childHandler(new ServerChannelInitializer(allChannels));
 
         ChannelFuture future = bootstrap.bind(InetAddress.getByName(args.getHost()), args.getPort()).sync();
@@ -148,6 +169,10 @@ public class Server {
         int channelCount = allChannels.size();
 
         logger.info("Shutting down...");
+
+        // Points and round records are batched, so write them before anything else stops.
+        PlayerPointService.flush();
+        RoundRecordService.flush();
 
         if (onlineCount > 0) {
             logger.info("Kicking {} player(s)...", onlineCount);

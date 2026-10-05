@@ -27,6 +27,9 @@ public class ServerArgs {
     private final Path pluginsDir;
     private final boolean proxyProtocol;
     private final String defaultLanguage;
+    private final int readTimeoutSeconds;
+    private final int maxConnections;
+    private final int maxRooms;
 
     public ServerArgs(String[] args) {
         OptionParser parser = new OptionParser();
@@ -66,6 +69,22 @@ public class ServerArgs {
                 .ofType(Integer.class)
                 .defaultsTo(8080);
 
+        // 5 秒太紧：选手弱网时会反复掉线并进入 5 分钟挂起，每次都打断当前回合。
+        OptionSpec<Integer> readTimeoutSpec = parser.accepts("read-timeout", "Seconds before an idle client is dropped")
+                .withRequiredArg()
+                .ofType(Integer.class)
+                .defaultsTo(20);
+
+        OptionSpec<Integer> maxConnectionsSpec = parser.accepts("max-connections", "Maximum simultaneous connections")
+                .withRequiredArg()
+                .ofType(Integer.class)
+                .defaultsTo(1000);
+
+        OptionSpec<Integer> maxRoomsSpec = parser.accepts("max-rooms", "Maximum rooms alive at once")
+                .withRequiredArg()
+                .ofType(Integer.class)
+                .defaultsTo(200);
+
         parser.accepts("help", "Show this help message").forHelp();
 
         OptionSet options;
@@ -93,6 +112,18 @@ public class ServerArgs {
         this.pluginsDir = Paths.get(options.valueOf(pluginsSpec));
         this.proxyProtocol = options.valueOf(proxyProtocol);
         this.defaultLanguage = options.valueOf(languageSpec);
+        this.readTimeoutSeconds = clampPositive(options.valueOf(readTimeoutSpec), 5);
+        this.maxConnections = clampPositive(options.valueOf(maxConnectionsSpec), 1);
+        this.maxRooms = clampPositive(options.valueOf(maxRoomsSpec), 1);
+    }
+
+    /** Keeps hand-edited values from turning the server into a no-op or a self-inflicted DoS. */
+    private static int clampPositive(int value, int minimum) {
+        if (value < minimum) {
+            logger.warn("Value {} is below the minimum {}, using {}", value, minimum, minimum);
+            return minimum;
+        }
+        return value;
     }
 
     private void printHelp(OptionParser parser) {
