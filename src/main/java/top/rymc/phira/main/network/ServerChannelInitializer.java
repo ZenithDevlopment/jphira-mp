@@ -18,6 +18,16 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.TimeUnit;
 
 public class ServerChannelInitializer extends ChannelInitializer<Channel> {
+
+    /** Pipeline name of the read timeout, replaced with a longer one after login. */
+    public static final String READ_TIMEOUT_HANDLER = "readTimeout";
+    /**
+     * Idle tolerance for a logged in player. Short timeouts are right for unknown peers, but a
+     * real client that pauses (backgrounded window, brief network hiccup) would otherwise be
+     * dropped mid round and forced into the five minute suspend.
+     */
+    public static final int AUTHENTICATED_READ_TIMEOUT_SECONDS = 120;
+
     private final ChannelGroup allChannels;
 
     public ServerChannelInitializer(ChannelGroup allChannels) {
@@ -83,7 +93,9 @@ public class ServerChannelInitializer extends ChannelInitializer<Channel> {
             channel.pipeline()
                     .addLast(new FrameDecoder())
                     .addLast(new FrameEncoder())
-                    .addLast(new ReadTimeoutHandler(Server.getInstance().getArgs().getReadTimeoutSeconds(), TimeUnit.SECONDS))
+                    // Named so it can be relaxed once the client has authenticated.
+                    .addLast(READ_TIMEOUT_HANDLER,
+                            new ReadTimeoutHandler(Server.getInstance().getArgs().getReadTimeoutSeconds(), TimeUnit.SECONDS))
                     .addLast(new ServerPacketDecoder())
                     .addLast(new ServerPacketEncoder());
 

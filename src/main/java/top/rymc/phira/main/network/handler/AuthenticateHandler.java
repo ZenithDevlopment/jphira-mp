@@ -11,8 +11,13 @@ import top.rymc.phira.main.game.room.RoomSnapshot;
 import top.rymc.phira.main.game.session.LocalSessionManager;
 import top.rymc.phira.main.game.exception.session.ResumeFailedException;
 import top.rymc.phira.main.game.exception.session.SuspendFailedException;
+import io.netty.channel.ChannelPipeline;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+
+import java.util.concurrent.TimeUnit;
 import top.rymc.phira.main.network.ConnectionReference;
 import top.rymc.phira.main.network.PlayerConnection;
+import top.rymc.phira.main.network.ServerChannelInitializer;
 import top.rymc.phira.main.util.PhiraFetcher;
 import top.rymc.phira.protocol.data.FullUserProfile;
 import top.rymc.phira.protocol.data.RoomInfo;
@@ -62,7 +67,8 @@ public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
                         } catch (SuspendFailedException e) {
                             remover.run();
                         }
-                    })
+
+                        })
             );
 
             LocalPlayer player = result.player();
@@ -74,6 +80,7 @@ public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
             }
 
             connection.send(ClientBoundAuthenticatePacket.success(new FullUserProfile(userInfo.getId(), userInfo.getName(), false), roomInfo));
+            relaxReadTimeout(connection);
             sendWelcomeMessages(player);
 
             if (view != null) {
@@ -107,6 +114,22 @@ public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
     @Override
     protected void onUnhandledPacket(ServerBoundPacket packet) {
         connection.close();
+    }
+
+    /**
+     * Widens the idle timeout now that the peer is a known player.
+     *
+     * <p>The handshake timeout exists to drop scanners quickly. Keeping it would instead drop
+     * players whose client simply paused for a while, which costs them the round in progress.
+     */
+    private static void relaxReadTimeout(PlayerConnection connection) {
+        ChannelPipeline pipeline = connection.getChannel().pipeline();
+        if (pipeline.get(ServerChannelInitializer.READ_TIMEOUT_HANDLER) == null) {
+            return;
+        }
+        pipeline.replace(ServerChannelInitializer.READ_TIMEOUT_HANDLER,
+                ServerChannelInitializer.READ_TIMEOUT_HANDLER,
+                new ReadTimeoutHandler(ServerChannelInitializer.AUTHENTICATED_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS));
     }
 
 }
