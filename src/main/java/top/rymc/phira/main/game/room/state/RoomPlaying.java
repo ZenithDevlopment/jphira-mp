@@ -1,5 +1,6 @@
 package top.rymc.phira.main.game.room.state;
 
+import top.rymc.phira.main.Server;
 import top.rymc.phira.main.data.ChartInfo;
 import top.rymc.phira.main.data.GameRecord;
 import top.rymc.phira.main.data.RoundRecord;
@@ -139,6 +140,8 @@ public final class RoomPlaying extends RoomGameState {
             playerNames.putIfAbsent(id, player.getName());
             gameRecords.put(id, record);
             savePhiraRecord(player, record);
+            Server.getLogger().info("Round in {}: {} submitted record {} (score {})",
+                    room.getRoomId(), player.getName(), record.getId(), record.getScore());
 
             String message = String.format(
                     """
@@ -250,6 +253,10 @@ public final class RoomPlaying extends RoomGameState {
 
         room.getChartPool().finishPlayingRound(room.getSetting().getRefreshIntervalRounds());
         cancelForceFinishCountdown();
+        // Logged because an empty round leaves no trace anywhere else, which makes "the round
+        // ended but nothing was recorded" impossible to tell apart from a crash.
+        Server.getLogger().info("Round in {} ended: {} of {} player(s) submitted a record",
+                room.getRoomId(), gameRecords.size(), activePlayerIds.size());
         broadcastRanking();
         RoomSelectChart state = new RoomSelectChart(room, stateUpdater, chart);
         for (Player player : room.getPlayerManager().getPlayers()) {
