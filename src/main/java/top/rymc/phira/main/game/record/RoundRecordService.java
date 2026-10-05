@@ -45,6 +45,10 @@ public final class RoundRecordService {
     private static final AtomicInteger SEQUENCE = new AtomicInteger();
 
     public static synchronized void preload() throws IOException {
+        // Cleared first so a second call replaces the history instead of duplicating it.
+        synchronized (RECORDS) {
+            RECORDS.clear();
+        }
         if (!Files.exists(RECORD_FILE)) {
             return;
         }

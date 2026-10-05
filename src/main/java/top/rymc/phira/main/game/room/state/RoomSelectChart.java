@@ -1,9 +1,11 @@
 package top.rymc.phira.main.game.room.state;
 
+import top.rymc.phira.main.Server;
 import top.rymc.phira.main.data.ChartInfo;
 import top.rymc.phira.main.game.exception.GameOperationException;
 import top.rymc.phira.main.game.player.Player;
 import top.rymc.phira.main.game.point.PlayerPointService;
+import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
 import top.rymc.phira.main.game.room.local.LocalRoom;
 import top.rymc.phira.protocol.data.monitor.judge.JudgeEvent;
@@ -82,6 +84,7 @@ public final class RoomSelectChart extends RoomGameState {
 
         stopCountdown();
         ChartInfo selectedChart = lockedChart != null ? lockedChart : selectWinningChart();
+        probeDuration(selectedChart);
         broadcastSystemMessage(player.getName() + " 提前开始本轮，曲目：" + formatChartName(selectedChart));
 
         RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart, readyIntents);
@@ -134,21 +137,30 @@ public final class RoomSelectChart extends RoomGameState {
     }
 
     public void vote(Player player, int chartId) {
+        // Every rejection is logged: the client renders a bare failure with no reason, so without
+        // this there is no way to tell "not allowed to vote" from "that chart is not in this pool".
         if (room.containsMonitor(player)) {
+            Server.getLogger().info("Vote rejected in {}: {} is a monitor", room.getRoomId(), player.getName());
             throw GameOperationException.permissionDenied();
         }
 
         if (lockedChart != null) {
+            Server.getLogger().info("Vote rejected in {}: chart already locked to {}",
+                    room.getRoomId(), formatChartName(lockedChart));
             sendSystemMessage(player, "本轮曲目已锁定，无法继续改票。");
             throw GameOperationException.invalidState();
         }
 
         if (!ChartPool.contains(chartId, currentPool)) {
+            Server.getLogger().info("Vote rejected in {}: chart {} is not in the current pool ({} charts)",
+                    room.getRoomId(), chartId, currentPool.size());
             throw GameOperationException.chartNotFound();
         }
 
         ChartInfo chart = ChartPool.getChartInfo(chartId);
         voteByPlayer.put(player.getId(), chartId);
+        Server.getLogger().info("Vote in {}: {} (#{}) -> {}", room.getRoomId(),
+                player.getName(), player.getId(), formatChartName(chart));
         broadcastSystemMessage(player.getName() + " 已投票：" + formatChartName(chart));
         broadcastLeadingChart();
         broadcastVoteBoardHint();
@@ -313,6 +325,7 @@ public final class RoomSelectChart extends RoomGameState {
         }
 
         ChartInfo selectedChart = lockedChart != null ? lockedChart : selectWinningChart();
+        probeDuration(selectedChart);
         broadcastSystemMessage("投票结束，本轮曲目：" + formatChartName(selectedChart));
 
         RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart, readyIntents);
@@ -338,6 +351,18 @@ public final class RoomSelectChart extends RoomGameState {
         }
 
         return candidates.get(RANDOM.nextInt(candidates.size()));
+    }
+
+    /**
+     * Starts resolving the chart's length in the background.
+     *
+     * <p>The forced-end deadline is derived from it, so a chart whose duration is still unknown
+     * only gets the fallback floor. Probing here means the next round on the same chart is exact.
+     */
+    private void probeDuration(ChartInfo selected) {
+        if (selected != null && selected.getDurationSeconds() == null) {
+            ChartIndex.probeDurationAsync(selected);
+        }
     }
 
     @Override

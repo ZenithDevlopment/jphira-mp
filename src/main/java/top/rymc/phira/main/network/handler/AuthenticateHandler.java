@@ -25,6 +25,7 @@ import top.rymc.phira.protocol.handler.server.SimpleServerBoundPacketHandler;
 import top.rymc.phira.protocol.packet.ClientBoundPacket;
 import top.rymc.phira.protocol.packet.ServerBoundPacket;
 import top.rymc.phira.protocol.packet.clientbound.ClientBoundAuthenticatePacket;
+import top.rymc.phira.protocol.packet.clientbound.ClientBoundPongPacket;
 import top.rymc.phira.protocol.packet.serverbound.*;
 
 public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
@@ -39,9 +40,14 @@ public class AuthenticateHandler extends SimpleServerBoundPacketHandler {
         this.connection = connection;
     }
 
+    /**
+     * A heartbeat can legitimately arrive before authentication, so it is answered rather than
+     * treated as an unexpected packet. The connection layer already replies to pings; this override
+     * only exists so the packet is not counted as unhandled here.
+     */
     @Override
     public void handle(ServerBoundPingPacket packet) {
-        onUnhandledPacket(packet);
+        connection.send(ClientBoundPongPacket.INSTANCE);
     }
 
     @Override

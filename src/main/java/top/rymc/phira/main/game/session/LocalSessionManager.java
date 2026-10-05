@@ -31,7 +31,7 @@ public class LocalSessionManager {
 
     @Getter
     @Setter
-    private static long suspendTimeoutMillis = TimeUnit.MINUTES.toMillis(5);
+    private static long suspendTimeoutMillis = TimeUnit.HOURS.toMillis(1);
 
     public static void setSuspendTimeout(long timeout, TimeUnit unit) {
         suspendTimeoutMillis = unit.toMillis(timeout);

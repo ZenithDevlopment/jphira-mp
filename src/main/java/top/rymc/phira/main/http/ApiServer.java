@@ -1275,6 +1275,11 @@ public final class ApiServer {
         info.put("chart", chartInfo(view.getState().getChart()));
         info.put("type", "local");
         info.put("config", roomConfig(room.getSetting()));
+        // The configured value is a floor: long charts push the real deadline out, and an operator
+        // needs to see the number that will actually fire rather than the one they typed.
+        info.put("effectiveForceFinish", view.getState() instanceof RoomPlaying playing
+                ? playing.effectiveForceFinishSeconds()
+                : room.getSetting().getForceFinishSeconds());
         info.put("pool", poolStatus(room));
         info.put("players", view.getPlayers().stream()
                 .map(p -> Map.of("id", p.getId(), "name", p.getName()))

@@ -38,6 +38,19 @@ public final class RoomPlaying extends RoomGameState {
     private static final int FORCE_FINISH_NOTICE_SECONDS = 10;
 
     /**
+     * Lower bound for the forced end, whatever the room is configured to.
+     *
+     * <p>Most charts have no probed duration (probing costs two range requests per chart and the
+     * upstream rate limits bursts, so only a few dozen of the catalogue are known), so this floor
+     * is what actually applies to most rounds. One hour covers the longest realistic chart plus
+     * loading and submission; a shorter ceiling silently truncates real play and voids scores.
+     */
+    private static final int MIN_FORCE_FINISH_SECONDS = 3600;
+
+    /** Extra time on top of the chart length for loading and submitting the score. */
+    private static final int FORCE_FINISH_GRACE_SECONDS = 120;
+
+    /**
      * Everything here is keyed by player id, never by {@link Player}.
      *
      * <p>A reconnect swaps the player instance, so object keys would silently split one player
@@ -202,7 +215,11 @@ public final class RoomPlaying extends RoomGameState {
             return;
         }
 
-        int forceFinishSeconds = room.getSetting().getForceFinishSeconds();
+        int forceFinishSeconds = effectiveForceFinishSeconds();
+        Server.getLogger().info(
+                "Room {} round on '{}' ({}s chart) will force finish after {}s (configured {})",
+                room.getRoomId(), chart.getName(), chart.getDurationSeconds(), forceFinishSeconds,
+                room.getSetting().getForceFinishSeconds());
         if (forceFinishSeconds > FORCE_FINISH_NOTICE_SECONDS) {
             forceFinishTasks.add(TIMER.schedule(
                     () -> broadcastSystemMessage("本轮游戏将在 " + FORCE_FINISH_NOTICE_SECONDS + " 秒后强制结束。"),
@@ -211,6 +228,25 @@ public final class RoomPlaying extends RoomGameState {
             ));
         }
         forceFinishTasks.add(TIMER.schedule(this::forceFinishGame, forceFinishSeconds, TimeUnit.SECONDS));
+    }
+
+    /**
+     * How long the round may run before it is ended regardless of progress.
+     *
+     * <p>The configured value is a floor for the stuck-player fallback, never a cap on song
+     * length: ending a 3 minute chart on a 120 second timer cuts it off mid-play and voids
+     * everyone's score. The chart's own length wins when it is longer, plus a grace window that
+     * covers loading and submitting afterwards.
+     */
+    public int effectiveForceFinishSeconds() {
+        int configured = room.getSetting().getForceFinishSeconds();
+        int floor = configured <= 0 ? MIN_FORCE_FINISH_SECONDS : Math.max(configured, MIN_FORCE_FINISH_SECONDS);
+
+        Integer duration = chart.getDurationSeconds();
+        if (duration == null || duration <= 0) {
+            return floor;
+        }
+        return Math.max(floor, duration + FORCE_FINISH_GRACE_SECONDS);
     }
 
     public void forceFinishByServer() {
@@ -260,7 +296,10 @@ public final class RoomPlaying extends RoomGameState {
         Server.getLogger().info("Round in {} ended: {} of {} player(s) submitted a record",
                 room.getRoomId(), gameRecords.size(), activePlayerIds.size());
         broadcastRanking();
-        RoomSelectChart state = new RoomSelectChart(room, stateUpdater, chart);
+        // No chart argument: the next round has to be voted for again. Carrying this round's chart
+        // over made toProtocol() report it as the new selection, so clients showed the previous
+        // song as already picked before anyone had voted.
+        RoomSelectChart state = new RoomSelectChart(room, stateUpdater);
         for (Player player : room.getPlayerManager().getPlayers()) {
             if (player.isOnline()) {
                 player.operations().ifPresent(op -> op.updateHostStatus(true));
@@ -314,6 +353,9 @@ public final class RoomPlaying extends RoomGameState {
 
     private void broadcastRanking() {
         if (gameRecords.isEmpty()) {
+            // Still record the round: a round that ended with nobody scoring is still a round that
+            // happened, and without this the history silently skips it.
+            recordRound(List.of());
             return;
         }
 
@@ -380,6 +422,12 @@ public final class RoomPlaying extends RoomGameState {
         }
         broadcastSystemMessage(MESSAGE_SEPARATOR);
 
+        recordRound(results);
+    }
+
+    /** Appends the round to the permanent history. Safe to call with no results. */
+    private void recordRound(List<RoundRecord.PlayerResult> results) {
+        long finishedAt = System.currentTimeMillis();
         RoundRecordService.append(new RoundRecord(
                 RoundRecordService.nextId(room.getRoomId(), finishedAt),
                 room.getRoomId(),

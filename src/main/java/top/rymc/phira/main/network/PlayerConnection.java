@@ -16,6 +16,8 @@ import top.rymc.phira.protocol.handler.server.ServerBoundPacketHandler;
 import top.rymc.phira.protocol.packet.ClientBoundPacket;
 import top.rymc.phira.protocol.packet.ServerBoundPacket;
 import top.rymc.phira.protocol.packet.clientbound.ClientBoundMessagePacket;
+import top.rymc.phira.protocol.packet.clientbound.ClientBoundPongPacket;
+import top.rymc.phira.protocol.packet.serverbound.ServerBoundPingPacket;
 
 import java.net.InetSocketAddress;
 import java.net.SocketException;
@@ -136,6 +138,16 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
         if (isClosed()) {
             return;
         }
+
+        // Keepalive is answered here rather than in the packet handlers: ping is transport level,
+        // and a handler that does not know it treats it as an unexpected packet and kicks. That
+        // made clients heartbeat from the lobby and reconnect every few seconds, because only
+        // RoomHandler knew how to answer.
+        if (packet instanceof ServerBoundPingPacket) {
+            send(ClientBoundPongPacket.INSTANCE);
+            return;
+        }
+
         try {
             packet.handle(packetHandler);
         } catch (Throwable t) {
@@ -146,6 +158,11 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         if (!ctx.channel().isActive()) {
+            // The peer went away first. Logged at debug rather than dropped, because a silent
+            // close is indistinguishable from a server-side kick when reading the logs after the
+            // fact.
+            Server.getLogger().debug("{}: connection already closed ({})",
+                    getRemoteAddressAsString(), cause.toString());
             return;
         }
 
@@ -169,7 +186,8 @@ public class PlayerConnection extends ChannelInboundHandlerAdapter {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         // Nothing to stop here: the packet pool is shared, and pending work is discarded by the
         // isClosed check the handlers perform before touching the channel.
-        Server.getLogger().info("Client disconnected: {}", getRemoteAddressAsString());
+        Server.getLogger().info("Client disconnected: {} ({})",
+                getRemoteAddressAsString(), connectState);
 
         for (Consumer<ChannelHandlerContext> handler : closeHandlers) {
             try {

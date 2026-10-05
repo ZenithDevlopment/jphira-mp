@@ -18,6 +18,7 @@ import top.rymc.phira.protocol.packet.ServerBoundPacket;
 import top.rymc.phira.protocol.packet.clientbound.*;
 import top.rymc.phira.protocol.packet.serverbound.ServerBoundCreateRoomPacket;
 import top.rymc.phira.protocol.packet.serverbound.ServerBoundJoinRoomPacket;
+import top.rymc.phira.protocol.packet.serverbound.ServerBoundPingPacket;
 
 import java.util.List;
 import java.util.regex.Pattern;
@@ -154,6 +155,16 @@ public class PlayHandler extends SimpleServerBoundPacketHandler implements Playe
         }
         player.getConnection().sendChat("你的积分：" + point.points() + "，积分排名：#" + point.rank());
         player.getConnection().sendChat("————————————————————————————————————————");
+    }
+
+    /**
+     * Required by the packet handler interface, and the reason clients used to be kicked from the
+     * lobby every heartbeat: ping used to fall through to {@link #onUnhandledPacket}. The reply
+     * itself is sent by the connection layer, which answers pings in every state.
+     */
+    @Override
+    public void handle(ServerBoundPingPacket packet) {
+        player.getConnection().send(ClientBoundPongPacket.INSTANCE);
     }
 
     @Override

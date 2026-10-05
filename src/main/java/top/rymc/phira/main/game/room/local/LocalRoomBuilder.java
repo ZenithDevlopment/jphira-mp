@@ -21,7 +21,7 @@ public class LocalRoomBuilder {
     private int minPlayer = 2;
     private int selectChartCountdownSeconds = 150;
     private int readyCountdownSeconds = 60;
-    private int forceFinishSeconds = 120;
+    private int forceFinishSeconds = 3600;
     private int refreshIntervalRounds = 5;
     private Set<Integer> adminIds = Set.of();
 

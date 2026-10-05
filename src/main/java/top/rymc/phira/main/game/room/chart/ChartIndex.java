@@ -4,6 +4,7 @@ import com.google.gson.reflect.TypeToken;
 import top.rymc.phira.main.Server;
 import top.rymc.phira.main.data.ChartInfo;
 import top.rymc.phira.main.util.ChartDuration;
+import top.rymc.phira.main.util.ExecutorServiceManager;
 import top.rymc.phira.main.util.GsonUtil;
 import top.rymc.phira.main.util.PhiraFetcher;
 import top.rymc.phira.main.util.ThreadFactoryCompat;
@@ -261,6 +262,30 @@ public final class ChartIndex {
         Server.getLogger().info("Duration probe finished: {}/{} resolved, {} failed",
                 resolved.get(), pending.size(), failed.get());
         return resolved.get();
+    }
+
+    /**
+     * Probes one chart in the background, for the case where a round is about to start on a chart
+     * whose length is still unknown.
+     *
+     * <p>Never blocks the caller: a room that has already picked its chart cannot wait on two
+     * range requests, and the forced-end deadline falls back to the floor when this misses.
+     */
+    public static void probeDurationAsync(ChartInfo chart) {
+        if (chart == null || chart.getDurationSeconds() != null) {
+            return;
+        }
+        ExecutorServiceManager.registerService(Executors.newSingleThreadExecutor(
+                ThreadFactoryCompat.THREAD_FACTORY_CREATOR.apply("ChartDurationProbe-Once")
+        )).execute(() -> {
+            try {
+                chart.setDurationSeconds(ChartDuration.PROBE.apply(chart.getId()));
+                saveUnchecked();
+                Server.getLogger().info("Probed duration of chart {}: {}s", chart.getId(), chart.getDurationSeconds());
+            } catch (IOException e) {
+                Server.getLogger().warn("Duration probe failed for chart {}: {}", chart.getId(), e.getMessage());
+            }
+        });
     }
 
     /** @return true when the chart was not indexed before */

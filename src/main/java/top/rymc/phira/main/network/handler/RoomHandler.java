@@ -120,8 +120,12 @@ public class RoomHandler extends ServerBoundPacketHandler implements Suspendable
         );
     }
 
+    /**
+     * Required by the packet handler interface. The answer itself lives in the connection layer,
+     * which replies to pings regardless of which handler is active, so this only has to exist.
+     */
     @Override
-    public void handle(ServerBoundPingPacket serverBoundPingPacket) {
+    public void handle(ServerBoundPingPacket packet) {
         player.getConnection().send(ClientBoundPongPacket.INSTANCE);
     }
 

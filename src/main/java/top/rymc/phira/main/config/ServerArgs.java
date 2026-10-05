@@ -70,11 +70,13 @@ public class ServerArgs {
                 .ofType(Integer.class)
                 .defaultsTo(8080);
 
-        // 5 秒太紧：选手弱网时会反复掉线并进入 5 分钟挂起，每次都打断当前回合。
+        // Netty read timeout: a client that sends nothing for this long is presumed dead. One hour
+        // keeps idle-but-live sessions (e.g. a player sitting in the lobby between rounds) from
+        // being dropped; the heartbeat still answers pings long before this fires.
         OptionSpec<Integer> readTimeoutSpec = parser.accepts("read-timeout", "Seconds before an idle client is dropped")
                 .withRequiredArg()
                 .ofType(Integer.class)
-                .defaultsTo(20);
+                .defaultsTo(3600);
 
         OptionSpec<Integer> maxConnectionsSpec = parser.accepts("max-connections", "Maximum simultaneous connections")
                 .withRequiredArg()
@@ -92,7 +94,7 @@ public class ServerArgs {
                         "Minutes a room may stay empty before being reclaimed (0 disables reclaiming)")
                 .withRequiredArg()
                 .ofType(Integer.class)
-                .defaultsTo(120);
+                .defaultsTo(60);
 
         parser.accepts("help", "Show this help message").forHelp();
 
