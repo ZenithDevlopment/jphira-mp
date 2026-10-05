@@ -16,6 +16,7 @@ import top.rymc.phira.main.data.UserInfo;
 import top.rymc.phira.main.game.player.PlayerManager;
 import top.rymc.phira.main.game.room.Room;
 import top.rymc.phira.main.game.room.RoomManager;
+import top.rymc.phira.main.game.room.RoomStore;
 import top.rymc.phira.main.game.room.RoomSnapshot;
 import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
@@ -380,6 +381,7 @@ public final class ApiServer {
                 .pools(pools)
                 .build(roomId);
         Server.getLogger().info("HTTP create room: {} pools={}", roomId, pools.stream().map(ChartPool.PoolSnapshot::id).toList());
+        RoomStore.save();
         ctx.json(Map.of("ok", true));
     }
 
@@ -448,6 +450,7 @@ public final class ApiServer {
             setting.setRefreshIntervalRounds(body.interval());
         }
         Server.getLogger().info("HTTP update room: {} fields updated", room.getRoomId());
+        RoomStore.save();
         ctx.json(Map.of("ok", true));
     }
 
@@ -485,6 +488,7 @@ public final class ApiServer {
         // running against a room nobody can reach any more.
         room.destroy();
         Server.getLogger().info("HTTP delete room: {}", room.getRoomId());
+        RoomStore.save();
         ctx.json(Map.of("ok", true));
     }
 

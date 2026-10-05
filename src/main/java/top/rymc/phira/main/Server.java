@@ -26,6 +26,7 @@ import top.rymc.phira.main.game.i18n.I18nService;
 import top.rymc.phira.main.game.point.PlayerPointService;
 import top.rymc.phira.main.game.record.RoundRecordService;
 import top.rymc.phira.main.game.room.RoomManager;
+import top.rymc.phira.main.game.room.RoomStore;
 import top.rymc.phira.main.game.room.chart.ChartIndex;
 import top.rymc.phira.main.game.room.chart.ChartPool;
 import top.rymc.phira.main.game.room.chart.SubmissionService;
@@ -111,6 +112,8 @@ public class Server {
 
         // Rooms created from the console or web manager never self destroy, so reap the idle ones.
         RoomManager.startWatchdog();
+        RoomStore.restore();
+        RoomStore.startAutoSave();
 
         ApiServer.start(args.getHttpHost(), args.getHttpPort());
 
@@ -173,6 +176,8 @@ public class Server {
         // Points and round records are batched, so write them before anything else stops.
         PlayerPointService.flush();
         RoundRecordService.flush();
+        RoomStore.save();
+        RoomStore.flush();
 
         if (onlineCount > 0) {
             logger.info("Kicking {} player(s)...", onlineCount);
