@@ -24,7 +24,13 @@ public final class RoomWaitForReady extends RoomGameState {
 
     private static final List<Integer> NOTICE_SECONDS = List.of(60, 30, 10, 5, 3, 2, 1);
 
-    private final Set<Player> readyPlayers = ConcurrentHashMap.newKeySet();
+    /**
+     * Ready players, keyed by id rather than by object.
+     *
+     * <p>A reconnect replaces the connection and can replace the player instance too, which
+     * would silently drop someone who had already pressed ready.
+     */
+    private final Set<Integer> readyPlayerIds = ConcurrentHashMap.newKeySet();
     private final Set<ScheduledFuture<?>> countdownTasks = ConcurrentHashMap.newKeySet();
     private volatile boolean countdownRunning;
 
@@ -51,7 +57,7 @@ public final class RoomWaitForReady extends RoomGameState {
 
     @Override
     public void handleLeave(Player player) {
-        readyPlayers.remove(player);
+        readyPlayerIds.remove(player.getId());
         updateState();
     }
 
@@ -62,15 +68,19 @@ public final class RoomWaitForReady extends RoomGameState {
 
     @Override
     public void ready(Player player) {
-        readyPlayers.add(player);
+        readyPlayerIds.add(player.getId());
         broadcast(op -> op.memberReady(player.getId()));
         updateState();
     }
 
     @Override
     public void cancelReady(Player player) {
-        readyPlayers.remove(player);
+        readyPlayerIds.remove(player.getId());
         broadcast(op -> op.memberCancelReady(player.getId()));
+    }
+
+    private boolean isReady(Player player) {
+        return readyPlayerIds.contains(player.getId());
     }
 
     @Override
@@ -140,7 +150,7 @@ public final class RoomWaitForReady extends RoomGameState {
                 .filter(Player::isOnline)
                 .collect(Collectors.toSet());
 
-        return !onlinePlayers.isEmpty() && readyPlayers.containsAll(onlinePlayers);
+        return !onlinePlayers.isEmpty() && onlinePlayers.stream().allMatch(this::isReady);
     }
 
     private void finishCountdown() {
@@ -156,19 +166,19 @@ public final class RoomWaitForReady extends RoomGameState {
     private void enterPlaying() {
         Set<Player> activePlayers = room.getPlayerManager().getPlayers().stream()
                 .filter(Player::isOnline)
-                .filter(readyPlayers::contains)
+                .filter(this::isReady)
                 .collect(Collectors.toSet());
 
         room.getPlayerManager().getPlayers().stream()
                 .filter(Player::isOnline)
-                .filter(player -> !readyPlayers.contains(player))
+                .filter(player -> !isReady(player))
                 .forEach(player -> player.operations().ifPresent(op -> {
                     op.updateHostStatus(true);
                     op.enterState(new SelectChart(chart.getId()));
                 }));
         room.getPlayerManager().getMonitors().stream()
                 .filter(Player::isOnline)
-                .filter(player -> !readyPlayers.contains(player))
+                .filter(player -> !isReady(player))
                 .forEach(player -> player.operations().ifPresent(op -> op.enterState(new SelectChart(chart.getId()))));
 
         if (activePlayers.isEmpty()) {
@@ -183,16 +193,16 @@ public final class RoomWaitForReady extends RoomGameState {
         updateGameState(state, false);
         room.getPlayerManager().getPlayers().stream()
                 .filter(Player::isOnline)
-                .filter(readyPlayers::contains)
+                .filter(this::isReady)
                 .forEach(player -> player.operations().ifPresent(op -> op.enterState(state.toProtocol())));
         room.getPlayerManager().getMonitors().stream()
                 .filter(Player::isOnline)
-                .filter(readyPlayers::contains)
+                .filter(this::isReady)
                 .forEach(player -> player.operations().ifPresent(op -> op.enterState(state.toProtocol())));
         activePlayers.forEach(player -> player.operations().ifPresent(PlayerOperations::gameStartPlaying));
         room.getPlayerManager().getMonitors().stream()
                 .filter(Player::isOnline)
-                .filter(readyPlayers::contains)
+                .filter(this::isReady)
                 .forEach(player -> player.operations().ifPresent(PlayerOperations::gameStartPlaying));
     }
 
