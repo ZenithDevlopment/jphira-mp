@@ -35,6 +35,8 @@ public final class RoomSelectChart extends RoomGameState {
     private final List<ChartInfo> currentPool;
     private final int countdownSeconds;
     private final AtomicBoolean countdownRunning = new AtomicBoolean();
+    /** Ready pressed while still voting; honoured when the ready phase starts. */
+    private final Set<Integer> readyIntents = ConcurrentHashMap.newKeySet();
     private volatile ChartInfo lockedChart;
 
     public RoomSelectChart(LocalRoom room, Consumer<RoomGameState> stateUpdater) {
@@ -81,14 +83,23 @@ public final class RoomSelectChart extends RoomGameState {
         ChartInfo selectedChart = lockedChart != null ? lockedChart : selectWinningChart();
         broadcastSystemMessage(player.getName() + " 提前开始本轮，曲目：" + formatChartName(selectedChart));
 
-        RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart);
+        RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart, readyIntents);
         updateGameState(state);
         state.startCountdown();
     }
 
+    /**
+     * Ready pressed during voting.
+     *
+     * <p>Clients flip their button to "cancel" as soon as the player presses it, so refusing
+     * here outright would leave the UI claiming a readiness the server never recorded. The
+     * intent is kept and honoured once the ready phase actually starts.
+     */
     @Override
     public void ready(Player player) {
-        throw GameOperationException.invalidState();
+        readyIntents.add(player.getId());
+        broadcast(op -> op.memberReady(player.getId()));
+        updateCountdownState();
     }
 
     @Override
@@ -302,7 +313,7 @@ public final class RoomSelectChart extends RoomGameState {
         ChartInfo selectedChart = lockedChart != null ? lockedChart : selectWinningChart();
         broadcastSystemMessage("投票结束，本轮曲目：" + formatChartName(selectedChart));
 
-        RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart);
+        RoomWaitForReady state = new RoomWaitForReady(room, stateUpdater, selectedChart, readyIntents);
         updateGameState(state);
         state.startCountdown();
     }

@@ -46,6 +46,24 @@ public final class RoomWaitForReady extends RoomGameState {
         super(room, stateUpdater, chart);
     }
 
+    /**
+     * Carries over players who already pressed ready while voting.
+     *
+     * <p>Those clients show a "cancel" button, so the server has to agree with them; otherwise the
+     * round ends with nobody ready even though everybody believes they were.
+     */
+    public RoomWaitForReady(LocalRoom room, Consumer<RoomGameState> stateUpdater, ChartInfo chart,
+                            Set<Integer> initiallyReady) {
+        super(room, stateUpdater, chart);
+        if (initiallyReady == null || initiallyReady.isEmpty()) {
+            return;
+        }
+        readyPlayerIds.addAll(initiallyReady);
+        room.getPlayerManager().getPlayers().stream()
+                .filter(player -> initiallyReady.contains(player.getId()))
+                .forEach(player -> player.operations().ifPresent(op -> op.memberReady(player.getId())));
+    }
+
     @Override
     public void handleJoin(Player player) {
         player.operations().ifPresent(op -> {
