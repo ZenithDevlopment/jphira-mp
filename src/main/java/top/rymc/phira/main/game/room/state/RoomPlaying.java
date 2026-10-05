@@ -35,14 +35,21 @@ public final class RoomPlaying extends RoomGameState {
 
     private static final int FORCE_FINISH_NOTICE_SECONDS = 10;
 
-    private final Set<Player> activePlayers = ConcurrentHashMap.newKeySet();
-    private final Set<Player> donePlayers = ConcurrentHashMap.newKeySet();
+    /**
+     * Everything here is keyed by player id, never by {@link Player}.
+     *
+     * <p>A reconnect swaps the player instance, so object keys would silently split one player
+     * into two: duplicated ranking rows, a lost readiness, and truncated replay data.
+     */
+    private final Set<Integer> activePlayerIds = ConcurrentHashMap.newKeySet();
+    private final Set<Integer> donePlayerIds = ConcurrentHashMap.newKeySet();
 
-    private final Map<Player, GameRecord> gameRecords = new ConcurrentHashMap<>();
-    private final Map<Player, PhiraRecord> playerRecords = new ConcurrentHashMap<>();
+    private final Map<Integer, GameRecord> gameRecords = new ConcurrentHashMap<>();
+    private final Map<Integer, String> playerNames = new ConcurrentHashMap<>();
+    private final Map<Integer, PhiraRecord> playerRecords = new ConcurrentHashMap<>();
 
-    private final Map<Player, List<TouchFrame>> touchFrames = new ConcurrentHashMap<>();
-    private final Map<Player, List<JudgeEvent>> judgeEvents = new ConcurrentHashMap<>();
+    private final Map<Integer, List<TouchFrame>> touchFrames = new ConcurrentHashMap<>();
+    private final Map<Integer, List<JudgeEvent>> judgeEvents = new ConcurrentHashMap<>();
     private final Set<ScheduledFuture<?>> forceFinishTasks = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean roundFinished = new AtomicBoolean(false);
     private final AtomicBoolean forceFinishCountdownStarted = new AtomicBoolean(false);
@@ -57,9 +64,10 @@ public final class RoomPlaying extends RoomGameState {
         super(room, stateUpdater, chart);
     }
 
-    public RoomPlaying(LocalRoom room, Consumer<RoomGameState> stateUpdater, ChartInfo chart, Set<Player> activePlayers) {
+    public RoomPlaying(LocalRoom room, Consumer<RoomGameState> stateUpdater, ChartInfo chart,
+                       Set<Integer> activePlayerIds) {
         super(room, stateUpdater, chart);
-        this.activePlayers.addAll(activePlayers);
+        this.activePlayerIds.addAll(activePlayerIds);
         // Registered here rather than on the first submitted record: if every player stalls on
         // the loading screen without submitting or disconnecting, the round would never end.
         startForceFinishCountdown();
@@ -72,7 +80,7 @@ public final class RoomPlaying extends RoomGameState {
 
     @Override
     public void handleLeave(Player player) {
-        if (activePlayers.contains(player)) {
+        if (activePlayerIds.contains(player.getId())) {
             finishPlayer(player, false);
         }
     }
@@ -94,22 +102,23 @@ public final class RoomPlaying extends RoomGameState {
 
     @Override
     public void touchSend(Player player, List<TouchFrame> touchFrames) {
-        this.touchFrames.computeIfAbsent(player, p -> new CopyOnWriteArrayList<>()).addAll(touchFrames);
+        this.touchFrames.computeIfAbsent(player.getId(), p -> new CopyOnWriteArrayList<>()).addAll(touchFrames);
     }
 
     @Override
     public void judgeSend(Player player, List<JudgeEvent> judgeEvents) {
-        this.judgeEvents.computeIfAbsent(player, p -> new CopyOnWriteArrayList<>()).addAll(judgeEvents);
+        this.judgeEvents.computeIfAbsent(player.getId(), p -> new CopyOnWriteArrayList<>()).addAll(judgeEvents);
     }
 
     @Override
     public void abort(Player player) {
-        if (!activePlayers.contains(player) || donePlayers.contains(player)) {
+        int id = player.getId();
+        if (!activePlayerIds.contains(id) || donePlayerIds.contains(id)) {
             return;
         }
 
         try {
-            broadcast(op -> op.gameAbort(player.getId()));
+            broadcast(op -> op.gameAbort(id));
         } finally {
             finishPlayer(player, true);
         }
@@ -117,7 +126,8 @@ public final class RoomPlaying extends RoomGameState {
 
     @Override
     public void played(Player player, int recordId) {
-        if (!activePlayers.contains(player) || donePlayers.contains(player)) {
+        int id = player.getId();
+        if (!activePlayerIds.contains(id) || donePlayerIds.contains(id)) {
             return;
         }
 
@@ -126,7 +136,8 @@ public final class RoomPlaying extends RoomGameState {
                 throw GameOperationException.recordNotFound();
             }).apply(recordId);
 
-            gameRecords.put(player, record);
+            playerNames.putIfAbsent(id, player.getName());
+            gameRecords.put(id, record);
             savePhiraRecord(player, record);
 
             String message = String.format(
@@ -159,8 +170,9 @@ public final class RoomPlaying extends RoomGameState {
     }
 
     private void savePhiraRecord(Player player, GameRecord record) {
-        List<TouchFrame> playerTouchFrames = touchFrames.getOrDefault(player, List.of());
-        List<JudgeEvent> playerJudgeEvents = judgeEvents.getOrDefault(player, List.of());
+        int id = player.getId();
+        List<TouchFrame> playerTouchFrames = touchFrames.getOrDefault(id, List.of());
+        List<JudgeEvent> playerJudgeEvents = judgeEvents.getOrDefault(id, List.of());
 
         if (playerTouchFrames.isEmpty() && playerJudgeEvents.isEmpty()) {
             return;
@@ -171,13 +183,13 @@ public final class RoomPlaying extends RoomGameState {
                 record.getTime().toInstant().toEpochMilli(),
                 chart.getId(),
                 chart.getName(),
-                player.getId(),
+                id,
                 player.getName(),
                 playerTouchFrames,
                 playerJudgeEvents
         );
 
-        playerRecords.put(player, phiraRecord);
+        playerRecords.put(id, phiraRecord);
     }
 
     private void startForceFinishCountdown() {
@@ -217,11 +229,11 @@ public final class RoomPlaying extends RoomGameState {
     }
 
     private void finishPlayer(Player player, boolean updateClientState) {
-        donePlayers.add(player);
+        donePlayerIds.add(player.getId());
 
         if (updateClientState && player.isOnline()) {
             player.operations().ifPresent(op -> {
-                op.updateHostStatus(room.isHost(player));
+                op.updateHostStatus(room.canControl(player));
                 op.enterState(new SelectChart(chart.getId()));
             });
         }
@@ -240,9 +252,11 @@ public final class RoomPlaying extends RoomGameState {
         cancelForceFinishCountdown();
         broadcastRanking();
         RoomSelectChart state = new RoomSelectChart(room, stateUpdater, chart);
-        activePlayers.stream()
-                .filter(Player::isOnline)
-                .forEach(player -> player.operations().ifPresent(op -> op.updateHostStatus(room.isHost(player))));
+        for (Player player : room.getPlayerManager().getPlayers()) {
+            if (player.isOnline()) {
+                player.operations().ifPresent(op -> op.updateHostStatus(room.canControl(player)));
+            }
+        }
         broadcast(PlayerOperations::gameEnd);
         updateGameState(state);
         state.broadcastVoteBoardHint();
@@ -254,33 +268,36 @@ public final class RoomPlaying extends RoomGameState {
             return;
         }
 
-        List<Map.Entry<Player, GameRecord>> ranking = gameRecords.entrySet().stream()
-                .sorted(Map.Entry.<Player, GameRecord>comparingByValue(
-                        Comparator.comparingInt(GameRecord::getScore).reversed()
-                                .thenComparing(Comparator.comparingDouble(GameRecord::getAccuracy).reversed())
-                                .thenComparingDouble(GameRecord::getStd)
-                ))
+        List<Map.Entry<Integer, GameRecord>> ranking = gameRecords.entrySet().stream()
+                .sorted(Map.Entry.<Integer, GameRecord>comparingByValue(
+                                Comparator.comparingInt(GameRecord::getScore).reversed()
+                                        .thenComparing(Comparator.comparingDouble(GameRecord::getAccuracy).reversed())
+                                        .thenComparingDouble(GameRecord::getStd))
+                        .thenComparingInt(Map.Entry::getKey)
+                )
                 .toList();
 
         // Phase 1: decide the ranks and award the whole round in one batch, so the shared
         // ranking cache is invalidated once instead of once per player.
         List<RankedPlayer> ranked = new ArrayList<>(ranking.size());
-        Map<Integer, Integer> gainedByPlayerId = new LinkedHashMap<>();
-        Map<Integer, String> nameByPlayerId = new LinkedHashMap<>();
         int rank = 0;
         GameRecord previous = null;
         for (int i = 0; i < ranking.size(); i++) {
-            Map.Entry<Player, GameRecord> entry = ranking.get(i);
+            Map.Entry<Integer, GameRecord> entry = ranking.get(i);
             GameRecord record = entry.getValue();
             if (previous == null || compareRecord(record, previous) != 0) {
                 rank = i + 1;
             }
-            ranked.add(new RankedPlayer(entry.getKey(), record, rank, getPointsByRank(rank)));
+            ranked.add(new RankedPlayer(entry.getKey(), nameOf(entry.getKey()), record, rank,
+                    getPointsByRank(rank)));
             previous = record;
         }
+
+        Map<Integer, Integer> gainedByPlayerId = new LinkedHashMap<>();
+        Map<Integer, String> nameByPlayerId = new LinkedHashMap<>();
         ranked.forEach(entry -> {
-            gainedByPlayerId.put(entry.player().getId(), entry.gainedPoints());
-            nameByPlayerId.put(entry.player().getId(), entry.player().getName());
+            gainedByPlayerId.put(entry.playerId(), entry.gainedPoints());
+            nameByPlayerId.put(entry.playerId(), entry.name());
         });
         Map<Integer, Integer> totals = PlayerPointService.addPointsBatch(gainedByPlayerId, nameByPlayerId);
 
@@ -290,11 +307,11 @@ public final class RoomPlaying extends RoomGameState {
         broadcastSystemMessage(MESSAGE_SEPARATOR);
         broadcastSystemMessage("本轮排名");
         for (RankedPlayer entry : ranked) {
-            int totalPoints = totals.getOrDefault(entry.player().getId(), 0);
+            int totalPoints = totals.getOrDefault(entry.playerId(), 0);
             broadcastSystemMessage(String.format(
                     "%d. %s - 分数: %s, 准度: %s%%, 误差: ±%sms, 积分: +%s, 总积分: %s",
                     entry.rank(),
-                    entry.player().getName(),
+                    entry.name(),
                     entry.record().getScore(),
                     entry.record().getAccuracy() * 100,
                     entry.record().getStd() * 1000,
@@ -302,8 +319,8 @@ public final class RoomPlaying extends RoomGameState {
                     totalPoints
             ));
             results.add(new RoundRecord.PlayerResult(
-                    entry.player().getId(),
-                    entry.player().getName(),
+                    entry.playerId(),
+                    entry.name(),
                     entry.rank(),
                     entry.record().getScore(),
                     entry.record().getAccuracy(),
@@ -325,7 +342,20 @@ public final class RoomPlaying extends RoomGameState {
         ));
     }
 
-    private record RankedPlayer(Player player, GameRecord record, int rank, int gainedPoints) {
+    /** Falls back to the id when the player already left, so the ranking row is never blank. */
+    private String nameOf(int playerId) {
+        String name = playerNames.get(playerId);
+        if (name != null) {
+            return name;
+        }
+        return room.getPlayerManager().getPlayers().stream()
+                .filter(player -> player.getId() == playerId)
+                .map(Player::getName)
+                .findFirst()
+                .orElse("#" + playerId);
+    }
+
+    private record RankedPlayer(int playerId, String name, GameRecord record, int rank, int gainedPoints) {
     }
 
     private int compareRecord(GameRecord a, GameRecord b) {
@@ -346,11 +376,13 @@ public final class RoomPlaying extends RoomGameState {
     }
 
     private boolean isAllOnlineActivePlayersDone() {
-        Set<Player> onlineActivePlayers = activePlayers.stream()
-                .filter(Player::isOnline)
+        // Looked up per id so a player who reconnected mid round still counts as active.
+        Set<Integer> onlineActive = activePlayerIds.stream()
+                .filter(id -> room.getPlayerManager().getPlayers().stream()
+                        .anyMatch(player -> player.getId() == id && player.isOnline()))
                 .collect(Collectors.toSet());
 
-        return donePlayers.containsAll(onlineActivePlayers);
+        return donePlayerIds.containsAll(onlineActive);
     }
 
     @Override

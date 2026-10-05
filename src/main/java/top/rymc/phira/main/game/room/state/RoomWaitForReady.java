@@ -191,7 +191,7 @@ public final class RoomWaitForReady extends RoomGameState {
                 .filter(Player::isOnline)
                 .filter(player -> !isReady(player))
                 .forEach(player -> player.operations().ifPresent(op -> {
-                    op.updateHostStatus(room.isHost(player));
+                    op.updateHostStatus(room.canControl(player));
                     op.enterState(new SelectChart(chart.getId()));
                 }));
         room.getPlayerManager().getMonitors().stream()
@@ -207,7 +207,8 @@ public final class RoomWaitForReady extends RoomGameState {
             return;
         }
 
-        RoomPlaying state = new RoomPlaying(room, stateUpdater, chart, activePlayers);
+        Set<Integer> activeIds = activePlayers.stream().map(Player::getId).collect(Collectors.toSet());
+        RoomPlaying state = new RoomPlaying(room, stateUpdater, chart, activeIds);
         updateGameState(state, false);
         room.getPlayerManager().getPlayers().stream()
                 .filter(Player::isOnline)

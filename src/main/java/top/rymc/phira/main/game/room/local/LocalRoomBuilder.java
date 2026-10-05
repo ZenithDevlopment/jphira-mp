@@ -7,6 +7,7 @@ import top.rymc.phira.main.game.room.chart.RoomChartPool;
 import top.rymc.phira.main.game.room.state.RoomGameState;
 
 import java.util.List;
+import java.util.Set;
 
 public class LocalRoomBuilder {
 
@@ -22,6 +23,12 @@ public class LocalRoomBuilder {
     private int readyCountdownSeconds = 60;
     private int forceFinishSeconds = 120;
     private int refreshIntervalRounds = 5;
+    private Set<Integer> adminIds = Set.of();
+
+    public LocalRoomBuilder adminIds(Set<Integer> adminIds) {
+        this.adminIds = adminIds == null ? Set.of() : Set.copyOf(adminIds);
+        return this;
+    }
     private List<ChartPool.PoolSnapshot> pools;
     private RoomGameState.Type state = RoomGameState.Type.SelectChart;
     private ChartInfo chart;
@@ -114,13 +121,15 @@ public class LocalRoomBuilder {
         this.readyCountdownSeconds = setting.getReadyCountdownSeconds();
         this.forceFinishSeconds = setting.getForceFinishSeconds();
         this.refreshIntervalRounds = setting.getRefreshIntervalRounds();
+        this.adminIds = setting.getAdminIds() == null ? Set.of() : Set.copyOf(setting.getAdminIds());
         return this;
     }
 
     public LocalRoom.RoomSetting buildSetting() {
         return new LocalRoom.RoomSetting(
             autoDestroy, host, maxPlayer, locked, cycle, live, chat,
-            minPlayer, selectChartCountdownSeconds, readyCountdownSeconds, forceFinishSeconds, refreshIntervalRounds
+            minPlayer, selectChartCountdownSeconds, readyCountdownSeconds, forceFinishSeconds, refreshIntervalRounds,
+            adminIds
         );
     }
 

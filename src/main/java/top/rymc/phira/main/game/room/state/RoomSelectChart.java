@@ -29,7 +29,8 @@ public final class RoomSelectChart extends RoomGameState {
     private static final List<Integer> NOTICE_SECONDS = List.of(150, 120, 90, 60, 30, 10, 5, 3, 2, 1);
     private static final Random RANDOM = new Random();
 
-    private final Map<Player, Integer> voteByPlayer = new ConcurrentHashMap<>();
+    /** Keyed by player id so a reconnect does not reset or duplicate a player's vote. */
+    private final Map<Integer, Integer> voteByPlayer = new ConcurrentHashMap<>();
     private final Set<ScheduledFuture<?>> countdownTasks = ConcurrentHashMap.newKeySet();
     private final ChartPool.PoolSnapshot currentPoolInfo;
     private final List<ChartInfo> currentPool;
@@ -62,7 +63,7 @@ public final class RoomSelectChart extends RoomGameState {
 
     @Override
     public void handleLeave(Player player) {
-        voteByPlayer.remove(player);
+        voteByPlayer.remove(player.getId());
         broadcastVoteBoardHint();
         updateCountdownState();
     }
@@ -147,7 +148,7 @@ public final class RoomSelectChart extends RoomGameState {
         }
 
         ChartInfo chart = ChartPool.getChartInfo(chartId);
-        voteByPlayer.put(player, chartId);
+        voteByPlayer.put(player.getId(), chartId);
         broadcastSystemMessage(player.getName() + " 已投票：" + formatChartName(chart));
         broadcastLeadingChart();
         broadcastVoteBoardHint();
@@ -173,7 +174,7 @@ public final class RoomSelectChart extends RoomGameState {
 
         int firstVoter = voteByPlayer.entrySet().stream()
                 .filter(entry -> entry.getValue().equals(leading.getId()))
-                .map(entry -> entry.getKey().getId())
+                .map(Map.Entry::getKey)
                 .min(Integer::compareTo)
                 .orElse(SYSTEM_PLAYER_ID);
 

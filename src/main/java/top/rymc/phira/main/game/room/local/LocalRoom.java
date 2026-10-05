@@ -68,6 +68,13 @@ public class LocalRoom implements Room {
         private int readyCountdownSeconds;
         private int forceFinishSeconds;
         private int refreshIntervalRounds;
+        /**
+         * Extra users allowed to drive the room, on top of whoever holds the host slot.
+         *
+         * <p>Kept separate from the host so an operator can start rounds without depending on
+         * who happened to join first.
+         */
+        private Set<Integer> adminIds;
 
     }
 
@@ -188,7 +195,7 @@ public class LocalRoom implements Room {
     public class LocalOperation implements Operation {
 
         private void validateHost(Player player) {
-            if (!isHost(player)) {
+            if (!canControl(player)) {
                 throw GameOperationException.notHost();
             }
         }
@@ -268,7 +275,8 @@ public class LocalRoom implements Room {
                     setting.cycle,
                     hostPlayer == null ? null : hostPlayer.getId(),
                     playerManager.getPlayersCopy(),
-                    playerManager.getMonitorsCopy()
+                    playerManager.getMonitorsCopy(),
+                    adminIdSet()
             );
         }
     }
@@ -277,6 +285,26 @@ public class LocalRoom implements Room {
     public boolean isHost(Player player) {
         Player host = hostPlayer;
         return host != null && player != null && host.getId() == player.getId();
+    }
+
+    /** Operator configured for this room, regardless of join order. */
+    public boolean isRoomAdmin(Player player) {
+        return player != null && adminIdSet().contains(player.getId());
+    }
+
+    /**
+     * Who may drive the room: the host plus any configured admin.
+     *
+     * <p>Clients hide voting and start controls from non hosts, so these users are also the ones
+     * told they are the host.
+     */
+    public boolean canControl(Player player) {
+        return isHost(player) || isRoomAdmin(player);
+    }
+
+    private Set<Integer> adminIdSet() {
+        Set<Integer> ids = setting.getAdminIds();
+        return ids == null ? Set.of() : ids;
     }
 
     /** First player to join and still present; drives host-only actions. */

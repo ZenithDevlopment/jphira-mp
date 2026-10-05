@@ -33,6 +33,8 @@ public class RoomSnapshot {
     private final Integer host;
     private final Set<Player> players;
     private final Set<Player> monitors;
+    /** Operators allowed to drive this room, in addition to the host. */
+    private final Set<Integer> adminIds;
 
     public ProtocolConvertible<RoomInfo> asProtocolConvertible(Player viewer) {
         return () -> new RoomInfo(
@@ -48,6 +50,11 @@ public class RoomSnapshot {
 
     public boolean isHost(Player player) {
         return host != null && player.getId() == host;
+    }
+
+    /** Host or configured operator: the users the client shows host controls to. */
+    public boolean canControl(Player player) {
+        return isHost(player) || (player != null && adminIds != null && adminIds.contains(player.getId()));
     }
 
     @Getter
@@ -89,7 +96,7 @@ public class RoomSnapshot {
                 runTask(() -> player.operations().ifPresent(operations -> operations.enterState(new WaitForReady())), delay);
             }
 
-            setHost(player, isHost(player));
+            setHost(player, canControl(player));
         }
         public void setHost(Player player, boolean value) {
             runTask(() -> player.operations().ifPresent(operations -> operations.updateHostStatus(value)), true);

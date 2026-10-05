@@ -37,6 +37,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -393,6 +394,19 @@ public final class ApiServer {
         LocalRoom.RoomSetting setting = room.getSetting();
         if (body.live() != null) {
             setting.setLive(body.live());
+        }
+        if (body.adminIds() != null) {
+            // Validated here: a typo would otherwise silently grant nobody control.
+            List<Integer> clean = new ArrayList<>();
+            for (int id : body.adminIds()) {
+                if (id <= 0) {
+                    throw new ApiException(400, "管理员 ID 必须是正整数");
+                }
+                if (!clean.contains(id)) {
+                    clean.add(id);
+                }
+            }
+            setting.setAdminIds(new LinkedHashSet<>(clean));
         }
         if (body.chatEnable() != null) {
             setting.setChat(body.chatEnable());
@@ -1316,6 +1330,7 @@ public final class ApiServer {
         config.put("readyCountdown", setting.getReadyCountdownSeconds());
         config.put("forceFinish", setting.getForceFinishSeconds());
         config.put("interval", setting.getRefreshIntervalRounds());
+        config.put("adminIds", setting.getAdminIds() == null ? List.of() : setting.getAdminIds());
         return config;
     }
 
@@ -1376,7 +1391,8 @@ public final class ApiServer {
             @SerializedName("selectCountdown") Integer selectCountdown,
             @SerializedName("readyCountdown") Integer readyCountdown,
             @SerializedName("forceFinish") Integer forceFinish,
-            Integer interval
+            Integer interval,
+            @SerializedName("adminIds") List<Integer> adminIds
     ) {
     }
 
