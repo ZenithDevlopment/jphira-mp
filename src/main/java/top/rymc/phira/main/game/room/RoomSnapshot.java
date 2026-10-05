@@ -96,10 +96,23 @@ public class RoomSnapshot {
                 runTask(() -> player.operations().ifPresent(operations -> operations.enterState(new WaitForReady())), delay);
             }
 
-            setHost(player, canControl(player));
+            setHost(player);
         }
-        public void setHost(Player player, boolean value) {
-            runTask(() -> player.operations().ifPresent(operations -> operations.updateHostStatus(value)), true);
+
+        /**
+         * Marks the client as host straight away.
+         *
+         * <p>The join packet carries no host flag, so this is the only thing that unlocks the
+         * voting and start buttons. It used to be delayed by 100ms, which lost the race against
+         * the client painting its room view: players saw a button-less room until they
+         * reconnected, at which point the flag finally arrived via the room info.
+         *
+         * <p>Everyone is told they are the host because this is a voting server: the client only
+         * renders those controls for the host, and votes are open to all players anyway. Real
+         * privileges are still enforced server side through {@code canControl}.
+         */
+        public void setHost(Player player) {
+            player.operations().ifPresent(operations -> operations.updateHostStatus(true));
         }
 
         private void runTask(Runnable task, boolean delay) {

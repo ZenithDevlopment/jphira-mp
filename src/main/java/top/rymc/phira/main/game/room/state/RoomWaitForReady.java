@@ -191,7 +191,7 @@ public final class RoomWaitForReady extends RoomGameState {
                 .filter(Player::isOnline)
                 .filter(player -> !isReady(player))
                 .forEach(player -> player.operations().ifPresent(op -> {
-                    op.updateHostStatus(room.canControl(player));
+                    op.updateHostStatus(true);
                     op.enterState(new SelectChart(chart.getId()));
                 }));
         room.getPlayerManager().getMonitors().stream()
