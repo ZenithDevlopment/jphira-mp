@@ -59,6 +59,14 @@ public final class RoundRecordService {
         }
     }
 
+    /** Re-reads the file after an import. */
+    public static synchronized void reload() throws IOException {
+        synchronized (RECORDS) {
+            RECORDS.clear();
+        }
+        preload();
+    }
+
     /** Unique, sortable id: a round finished later always compares greater. */
     public static String nextId(String roomId, long finishedAt) {
         return roomId + "-" + finishedAt + "-" + SEQUENCE.incrementAndGet();

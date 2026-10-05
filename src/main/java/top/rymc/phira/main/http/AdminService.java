@@ -1,5 +1,7 @@
 package top.rymc.phira.main.http;
 
+import com.google.gson.JsonSyntaxException;
+import top.rymc.phira.main.Server;
 import top.rymc.phira.main.util.GsonUtil;
 
 import java.io.IOException;
@@ -51,23 +53,36 @@ public final class AdminService {
         return removed;
     }
 
+    /** Re-reads the file, used after an import replaces it. */
+    public static synchronized void reload() {
+        load();
+    }
+
     private static synchronized void load() {
-        ADMIN_IDS.clear();
         if (!Files.exists(ADMIN_FILE)) {
             save();
             return;
         }
 
+        // Parse into a temporary set first: a corrupt or half written file must not wipe the
+        // list, otherwise every operator would be locked out of the panel at once.
+        Set<Integer> loaded = ConcurrentHashMap.newKeySet();
         try (Reader reader = Files.newBufferedReader(ADMIN_FILE)) {
             Integer[] ids = GsonUtil.getGson().fromJson(reader, Integer[].class);
             if (ids != null) {
                 for (int id : ids) {
-                    ADMIN_IDS.add(id);
+                    loaded.add(id);
                 }
             }
+        } catch (JsonSyntaxException e) {
+            Server.getLogger().error("admins.json is unreadable, keeping the current admin list", e);
+            return;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to load admin list", e);
         }
+
+        ADMIN_IDS.clear();
+        ADMIN_IDS.addAll(loaded);
     }
 
     private static synchronized void save() {

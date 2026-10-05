@@ -74,6 +74,8 @@ public final class SubmissionService {
     }
 
     public static synchronized void preload() {
+        // Cleared first: an import may have removed rows, and stale ones would otherwise survive.
+        ENTRIES.clear();
         if (!Files.exists(FILE)) {
             return;
         }

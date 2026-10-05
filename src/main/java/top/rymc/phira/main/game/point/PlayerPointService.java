@@ -128,6 +128,13 @@ public final class PlayerPointService {
         return ranking.size() + 1;
     }
 
+    /** Re-reads the file after an import, discarding anything not yet flushed. */
+    public static synchronized void reload() {
+        POINTS.clear();
+        VERSION.incrementAndGet();
+        load();
+    }
+
     /** Writes pending changes immediately, e.g. on shutdown. */
     public static void flush() {
         if (DIRTY.compareAndSet(true, false)) {

@@ -154,6 +154,12 @@ public final class ApiServer {
         config.routes.get("/api/v1/chart/search", ApiServer::handleChartSearch);
         config.routes.post("/api/v1/pool/generate", ApiServer::handlePoolGenerate);
         config.routes.post("/api/v1/chart/duration", ApiServer::handleChartDurationProbe);
+        // 数据导入导出
+        config.routes.get("/api/v1/data/{kind}/export", ApiServer::handleDataExport);
+        config.routes.post("/api/v1/data/{kind}/import", ApiServer::handleDataImport);
+        config.routes.get("/api/v1/data/{kind}/backups", ApiServer::handleDataBackups);
+        config.routes.post("/api/v1/data/{kind}/restore", ApiServer::handleDataRestore);
+
         config.routes.get("/api/v1/admin", ApiServer::handleAdminList);
         config.routes.post("/api/v1/admin", ApiServer::handleAdminAdd);
         config.routes.delete("/api/v1/admin/{userId}", ApiServer::handleAdminRemove);
@@ -508,6 +514,81 @@ public final class ApiServer {
         String message = body.message().strip().replaceAll("[\\r\\n]+", " ");
         // Players see this unthrottled, so keep it to something a chat line can hold.
         return message.length() > MAX_CHAT_LENGTH ? message.substring(0, MAX_CHAT_LENGTH) : message;
+    }
+
+    // ===== 数据导入导出 =====
+
+    /** Streams the stored document so it can be saved and moved to another server. */
+    private static void handleDataExport(Context ctx) {
+        requireAdmin(ctx);
+        DataTransferService.Kind kind = requireDataKind(ctx);
+        try {
+            String document = DataTransferService.exportJson(kind);
+            ctx.contentType("application/json");
+            ctx.header("Content-Disposition", "attachment; filename=\"" + kind.key() + ".json\"");
+            ctx.result(document);
+            Server.getLogger().info("HTTP export {}", kind.key());
+        } catch (IOException e) {
+            throw new ApiException(500, "导出失败：" + e.getMessage());
+        }
+    }
+
+    /** Accepts a document and either replaces the data set or merges into it. */
+    private static void handleDataImport(Context ctx) {
+        requireAdmin(ctx);
+        DataTransferService.Kind kind = requireDataKind(ctx);
+        boolean merge = "true".equalsIgnoreCase(blankToNull(ctx.queryParam("merge")))
+                || "merge".equalsIgnoreCase(blankToNull(ctx.queryParam("mode")));
+
+        // Text, not form encoded: the browser sends the file body verbatim.
+        String document = ctx.body();
+        if (document == null || document.isBlank()) {
+            throw new ApiException(400, "内容为空");
+        }
+        try {
+            DataTransferService.ImportResult result = DataTransferService.importJson(kind, document, merge);
+            ctx.json(Map.of("ok", true, "imported", result.imported(),
+                    "total", result.total(), "backup", result.backupFile()));
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(400, e.getMessage());
+        } catch (IOException e) {
+            throw new ApiException(500, "导入失败：" + e.getMessage());
+        }
+    }
+
+    private static void handleDataBackups(Context ctx) {
+        requireAdmin(ctx);
+        DataTransferService.Kind kind = requireDataKind(ctx);
+        try {
+            ctx.json(Map.of("ok", true, "backups", DataTransferService.listBackups(kind)));
+        } catch (IOException e) {
+            throw new ApiException(500, "无法列出备份");
+        }
+    }
+
+    private static void handleDataRestore(Context ctx) {
+        requireAdmin(ctx);
+        DataTransferService.Kind kind = requireDataKind(ctx);
+        RestoreBody body = bodyOrNull(ctx, RestoreBody.class);
+        if (body == null || body.backup() == null || body.backup().isBlank()) {
+            throw new ApiException(400, "请指定要恢复的备份");
+        }
+        try {
+            DataTransferService.ImportResult result = DataTransferService.restore(kind, body.backup());
+            ctx.json(Map.of("ok", true, "imported", result.imported()));
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(400, e.getMessage());
+        } catch (IOException e) {
+            throw new ApiException(500, "恢复失败：" + e.getMessage());
+        }
+    }
+
+    private static DataTransferService.Kind requireDataKind(Context ctx) {
+        DataTransferService.Kind kind = DataTransferService.Kind.of(ctx.pathParam("kind"));
+        if (kind == null) {
+            throw new ApiException(400, "未知数据类型：" + ctx.pathParam("kind"));
+        }
+        return kind;
     }
 
     // ===== 比赛记录 =====
@@ -1347,5 +1428,8 @@ public final class ApiServer {
     }
 
     public record SayBody(String message) {
+    }
+
+    public record RestoreBody(String backup) {
     }
 }
